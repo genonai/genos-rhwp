@@ -24,8 +24,8 @@ fn create_fontdb() -> usvg::fontdb::Database {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        fontdb.set_serif_family("바탕");
-        fontdb.set_sans_serif_family("맑은 고딕");
+        fontdb.set_serif_family("Noto Serif CJK KR");
+        fontdb.set_sans_serif_family("Noto Sans CJK KR");
         fontdb.set_monospace_family("D2Coding");
     }
     fontdb
@@ -39,7 +39,7 @@ fn pdf_sans_fallback() -> &'static str {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        "'Malgun Gothic','맑은 고딕','Segoe UI Symbol','Arial Unicode MS','Noto Sans Symbols 2','Noto Sans Symbols','Symbola','Apple SD Gothic Neo','AppleGothic','Noto Sans KR',sans-serif"
+        "'Noto Sans CJK KR','나눔고딕','NanumGothic','Noto Sans KR','Malgun Gothic','맑은 고딕','Segoe UI Symbol','Arial Unicode MS','Noto Sans Symbols 2','Noto Sans Symbols','Symbola','Apple SD Gothic Neo','AppleGothic',sans-serif"
     }
 }
 
@@ -51,7 +51,7 @@ fn pdf_serif_fallback() -> &'static str {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        "'바탕','Batang','Segoe UI Symbol','Arial Unicode MS','Noto Sans Symbols 2','Noto Sans Symbols','Symbola','Times New Roman',serif"
+        "'Noto Serif CJK KR','함초롬바탕','HCR Batang','나눔명조','NanumMyeongjo','바탕','Batang','Segoe UI Symbol','Arial Unicode MS','Noto Sans Symbols 2','Noto Sans Symbols','Symbola','Times New Roman',serif"
     }
 }
 
@@ -73,6 +73,22 @@ fn add_font_fallbacks(svg: &str) -> String {
     .replace(
         "font-family=\"HCI Poppy\"",
         &format!("font-family=\"HCI Poppy, {}\"", pdf_sans_fallback()),
+    )
+    .replace(
+        "font-family=\"맑은 고딕\"",
+        &format!("font-family=\"맑은 고딕, {}\"", pdf_sans_fallback()),
+    )
+    .replace(
+        "font-family=\"Malgun Gothic\"",
+        &format!("font-family=\"Malgun Gothic, {}\"", pdf_sans_fallback()),
+    )
+    .replace(
+        "font-family=\"휴먼고딕\"",
+        &format!("font-family=\"휴먼고딕, {}\"", pdf_sans_fallback()),
+    )
+    .replace(
+        "font-family=\"휴먼 고딕\"",
+        &format!("font-family=\"휴먼 고딕, {}\"", pdf_sans_fallback()),
     )
 }
 
