@@ -55,10 +55,40 @@ fn pdf_serif_fallback() -> &'static str {
     }
 }
 
-/// SVG에서 없는 한글 폰트명에 fallback 추가
+#[cfg(not(target_arch = "wasm32"))]
+fn pdf_mono_fallback() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "'Menlo','Courier New','D2Coding','Noto Sans Mono CJK KR',monospace"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "'D2Coding','Noto Sans Mono CJK KR','나눔고딕코딩','NanumGothicCoding','Courier New','DejaVu Sans Mono',monospace"
+    }
+}
+
+/// SVG의 font-family에 fallback chain을 추가한다.
+///
+/// 하이브리드 전략 (mydocs/tech/font_fallback_strategy.md §3.2 / §5 참조):
+///
+/// 1단계 — enumeration: 알려진 HWP/MS/한컴/HY/휴먼 계열 폰트는 카테고리(Serif/Sans/Mono)별로
+///         정확한 chain을 박는다. 시각적으로 명조→Serif, 고딕→Sans 매핑이 보존된다.
+///
+/// 2단계 — 정규식 폴백: 1단계에서 미처리된 단일 이름 font-family 는 이름 키워드
+///         (명조/바탕/Myeongjo/Batang → Serif, 고딕/돋움/Gothic/Dotum → Sans,
+///          Mono/Code → Mono) 로 카테고리를 추정해 chain을 박는다.
+///
+/// 3단계 — 디폴트: 카테고리 단서가 없는 폰트(영문 회사 폰트 등)는 Sans chain을 박는다.
+///         시각적 손실이 가장 작은 안전한 디폴트.
 #[cfg(not(target_arch = "wasm32"))]
 fn add_font_fallbacks(svg: &str) -> String {
-    svg.replace(
+    // 1단계: enumeration — 알려진 폰트별 카테고리 매핑.
+    // 키워드 추정만으로는 정확히 못 잡는 폰트 (예: "바탕체" → mono인지 serif인지)
+    // 와 빈번히 등장하는 한글 폰트를 우선 명시.
+    let mut s = svg.to_string();
+
+    // generic family → OS별 chain
+    s = s.replace(
         "font-family=\"sans-serif\"",
         &format!("font-family=\"{}\"", pdf_sans_fallback()),
     )
@@ -67,29 +97,76 @@ fn add_font_fallbacks(svg: &str) -> String {
         &format!("font-family=\"{}\"", pdf_serif_fallback()),
     )
     .replace(
-        "font-family=\"휴먼명조\"",
-        &format!("font-family=\"휴먼명조, {}\"", pdf_serif_fallback()),
-    )
-    .replace(
-        "font-family=\"HCI Poppy\"",
-        &format!("font-family=\"HCI Poppy, {}\"", pdf_sans_fallback()),
-    )
-    .replace(
-        "font-family=\"맑은 고딕\"",
-        &format!("font-family=\"맑은 고딕, {}\"", pdf_sans_fallback()),
-    )
-    .replace(
-        "font-family=\"Malgun Gothic\"",
-        &format!("font-family=\"Malgun Gothic, {}\"", pdf_sans_fallback()),
-    )
-    .replace(
-        "font-family=\"휴먼고딕\"",
-        &format!("font-family=\"휴먼고딕, {}\"", pdf_sans_fallback()),
-    )
-    .replace(
-        "font-family=\"휴먼 고딕\"",
-        &format!("font-family=\"휴먼 고딕, {}\"", pdf_sans_fallback()),
-    )
+        "font-family=\"monospace\"",
+        &format!("font-family=\"{}\"", pdf_mono_fallback()),
+    );
+
+    // Serif (명조/바탕 계열)
+    for name in &[
+        "휴먼명조", "한컴바탕", "새바탕", "함초롬바탕", "함초롱바탕",
+        "바탕", "Batang", "HY신명조", "HY견명조", "궁서", "새궁서",
+    ] {
+        let from = format!("font-family=\"{}\"", name);
+        let to = format!("font-family=\"{}, {}\"", name, pdf_serif_fallback());
+        s = s.replace(&from, &to);
+    }
+
+    // Monospace ("체" 가 붙은 Windows 고정폭 폰트 — Sans보다 먼저 처리)
+    for name in &[
+        "바탕체", "BatangChe", "돋움체", "DotumChe",
+        "굴림체", "GulimChe", "궁서체", "GungsuhChe",
+    ] {
+        let from = format!("font-family=\"{}\"", name);
+        let to = format!("font-family=\"{}, {}\"", name, pdf_mono_fallback());
+        s = s.replace(&from, &to);
+    }
+
+    // Sans-serif (고딕/돋움/굴림 계열)
+    for name in &[
+        "휴먼고딕", "휴먼 고딕", "한컴돋움", "새돋움",
+        "함초롬돋움", "함초롱돋움", "돋움", "Dotum",
+        "굴림", "Gulim", "새굴림",
+        "맑은 고딕", "Malgun Gothic",
+        "HY중고딕", "HY견고딕", "HY헤드라인M", "HY그래픽",
+        "HCI Poppy",
+    ] {
+        let from = format!("font-family=\"{}\"", name);
+        let to = format!("font-family=\"{}, {}\"", name, pdf_sans_fallback());
+        s = s.replace(&from, &to);
+    }
+
+    // 2단계 + 3단계: enumeration 에서 못 잡은 font-family 정규식 폴백.
+    // `font-family="X"` 패턴에서 X 안에 콤마가 없는 것 (=chain 미박힘) 만 매칭.
+    // 컴파일은 호출당 1회 — PDF 변환은 빈번하지 않으므로 static 캐시 불필요.
+    let re = regex::Regex::new(r#"font-family="([^",]+)""#).unwrap();
+    re.replace_all(&s, |caps: &regex::Captures| {
+        let name = &caps[1];
+        let lower = name.to_lowercase();
+
+        // 2단계: 키워드 기반 카테고리 추정
+        let chain = if name.contains("명조") || name.contains("바탕") || name.contains("궁서")
+            || lower.contains("myeongjo") || lower.contains("batang")
+            || lower.contains("serif")
+        {
+            pdf_serif_fallback()
+        } else if lower.contains("mono")
+            || lower.contains("coding")
+            || lower.ends_with(" code")
+            || lower == "code"
+        {
+            pdf_mono_fallback()
+        } else if name.contains("고딕") || name.contains("돋움") || name.contains("굴림")
+            || lower.contains("gothic") || lower.contains("dotum") || lower.contains("gulim")
+            || lower.contains("sans")
+        {
+            pdf_sans_fallback()
+        } else {
+            // 3단계: 카테고리 단서 없음 → 안전한 Sans 디폴트
+            pdf_sans_fallback()
+        };
+        format!(r#"font-family="{}, {}""#, name, chain)
+    })
+    .into_owned()
 }
 
 /// 단일 SVG를 PDF로 변환
