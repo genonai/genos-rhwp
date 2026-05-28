@@ -24,8 +24,10 @@ fn create_fontdb() -> usvg::fontdb::Database {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        fontdb.set_serif_family("Noto Serif CJK KR");
-        fontdb.set_sans_serif_family("Noto Sans CJK KR");
+        // 나눔 계열을 1순위로 — minimal Linux 환경에도 fonts-nanum 패키지로 기본 배포됨.
+        // 시스템에 나눔이 없으면 chain 따라 Noto CJK 로 폴백됨.
+        fontdb.set_serif_family("NanumMyeongjo");
+        fontdb.set_sans_serif_family("NanumGothic");
         fontdb.set_monospace_family("D2Coding");
     }
     fontdb
@@ -39,7 +41,8 @@ fn pdf_sans_fallback() -> &'static str {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        "'Noto Sans CJK KR','나눔고딕','NanumGothic','Noto Sans KR','Malgun Gothic','맑은 고딕','Segoe UI Symbol','Arial Unicode MS','Noto Sans Symbols 2','Noto Sans Symbols','Symbola','Apple SD Gothic Neo','AppleGothic',sans-serif"
+        // 나눔 계열 우선 (minimal Linux 호환성). Noto CJK 는 차순위 백업.
+        "'나눔고딕','NanumGothic','나눔바른고딕','NanumBarunGothic','Noto Sans CJK KR','Noto Sans KR','Malgun Gothic','맑은 고딕','Segoe UI Symbol','Arial Unicode MS','Noto Sans Symbols 2','Noto Sans Symbols','Symbola','Apple SD Gothic Neo','AppleGothic',sans-serif"
     }
 }
 
@@ -51,7 +54,8 @@ fn pdf_serif_fallback() -> &'static str {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        "'Noto Serif CJK KR','함초롬바탕','HCR Batang','나눔명조','NanumMyeongjo','바탕','Batang','Segoe UI Symbol','Arial Unicode MS','Noto Sans Symbols 2','Noto Sans Symbols','Symbola','Times New Roman',serif"
+        // 나눔 계열 우선 (minimal Linux 호환성). Noto CJK / HCR 은 차순위 백업.
+        "'나눔명조','NanumMyeongjo','함초롬바탕','HCR Batang','Noto Serif CJK KR','바탕','Batang','Segoe UI Symbol','Arial Unicode MS','Noto Sans Symbols 2','Noto Sans Symbols','Symbola','Times New Roman',serif"
     }
 }
 
@@ -63,7 +67,8 @@ fn pdf_mono_fallback() -> &'static str {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        "'D2Coding','Noto Sans Mono CJK KR','나눔고딕코딩','NanumGothicCoding','Courier New','DejaVu Sans Mono',monospace"
+        // D2Coding(나눔 계열 코드 폰트) 우선. fonts-nanum 패키지에 함께 배포됨.
+        "'D2Coding','D2Coding ligature','나눔고딕코딩','NanumGothicCoding','Noto Sans Mono CJK KR','Courier New','DejaVu Sans Mono',monospace"
     }
 }
 
