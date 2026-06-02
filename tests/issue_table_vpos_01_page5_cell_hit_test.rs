@@ -1,4 +1,4 @@
-//! samples/table-vpos-01.hwp 5쪽 인라인 표 셀 클릭 진입 불가 — RED 회귀 테스트.
+//! samples/table-vpos-01.hwp 5쪽 인라인 표 셀 클릭 진입 회귀 테스트.
 //!
 //! 재현 문서: `samples/table-vpos-01.hwp`
 //! 대상: 5쪽 (page index = 4) 의 3개 TAC inline 표:
@@ -9,8 +9,11 @@
 //! 좌표는 `cargo run -- export-svg samples/table-vpos-01.hwp -p 4 --debug-overlay`
 //! SVG 의 cell-clip 영역에서 측정 (96 DPI).
 //!
+//! [Task #990] pi=33(빈 문단 위 treat-as-char 도형) advance 이중 가산 정정으로
+//! pi=34 외곽 표 및 내부 11x3 표가 30.84px 위로 이동 — pi=34 inner 11x3 좌표 갱신.
+//!
 //! 본 테스트는 hit_test_native 반환 검증 + 실제 cell-entry(insert_text_in_cell_by_path)
-//! 검증을 모두 수행한다. 작성 시점에 page 5 의 inner 11x3 셀 케이스가 FAIL 해야 한다.
+//! 검증을 모두 수행한다.
 
 use std::path::Path;
 
@@ -49,7 +52,11 @@ fn path_tuples(hit: &Value) -> Vec<(usize, usize, usize)> {
 
 /// hit_test 결과가 (parent_para, control_index) 외곽 표에 안착했는지 + 셀 path 가 비어있지 않은지 검증.
 fn assert_table_hit(hit: &Value, parent_para: u64, control: u64) {
-    assert_eq!(hit["sectionIndex"].as_u64(), Some(0), "section must be 0, hit={hit}");
+    assert_eq!(
+        hit["sectionIndex"].as_u64(),
+        Some(0),
+        "section must be 0, hit={hit}"
+    );
     assert_eq!(
         hit["parentParaIndex"].as_u64(),
         Some(parent_para),
@@ -131,78 +138,78 @@ fn page5_big_inner_title_cell_returns_nested_path() {
 // pi=34 inner 11x3 — c=0 column 라벨 셀들 (rowspan=2)
 // =======================================================================
 
-/// cell[0] r=0,c=0 "1|참여소통" — cell-clip-52 (x=86.2 y=298.0 w=83.4 h=164.9), 중심 (128, 380)
+/// cell[0] r=0,c=0 "1|참여소통" — cell-clip-52 (x=86.2 y=267.16 w=83.4 h=164.9), 중심 (128, 349.16)
 #[test]
 fn page5_inner_11x3_c0_row0_label_cell() {
     let doc = load_doc();
-    let hit = hit_json(&doc, 4, 128.0, 380.0);
+    let hit = hit_json(&doc, 4, 128.0, 349.16);
     assert_table_hit(&hit, 34, 0);
     assert_nested_inner_cell(&hit, 0);
 }
 
-/// cell[7] r=3,c=0 "2|기본사회" — cell-clip-82 (x=86.2 y=475.6 w=83.4 h=164.9), 중심 (128, 558)
+/// cell[7] r=3,c=0 "2|기본사회" — cell-clip-82 (x=86.2 y=444.76 w=83.4 h=164.9), 중심 (128, 527.16)
 #[test]
 fn page5_inner_11x3_c0_row3_label_cell() {
     let doc = load_doc();
-    let hit = hit_json(&doc, 4, 128.0, 558.0);
+    let hit = hit_json(&doc, 4, 128.0, 527.16);
     assert_table_hit(&hit, 34, 0);
     assert_nested_inner_cell(&hit, 7);
 }
 
-/// cell[14] r=6,c=0 "3|공직혁신" — cell-clip-111 (x=86.2 y=653.1 w=83.4 h=159.1), 중심 (128, 732.7)
+/// cell[14] r=6,c=0 "3|공직혁신" — cell-clip-111 (x=86.2 y=622.26 w=83.4 h=159.1), 중심 (128, 701.86)
 #[test]
 fn page5_inner_11x3_c0_row6_label_cell() {
     let doc = load_doc();
-    let hit = hit_json(&doc, 4, 128.0, 732.7);
+    let hit = hit_json(&doc, 4, 128.0, 701.86);
     assert_table_hit(&hit, 34, 0);
     assert_nested_inner_cell(&hit, 14);
 }
 
-/// cell[19] r=9,c=0 "4|공공 AX" — cell-clip-136 (x=86.2 y=849.4 w=83.4 h=157.4), 중심 (128, 928.1)
+/// cell[19] r=9,c=0 "4|공공 AX" — cell-clip-136 (x=86.2 y=818.56 w=83.4 h=157.4), 중심 (128, 897.26)
 #[test]
 fn page5_inner_11x3_c0_row9_label_cell() {
     let doc = load_doc();
-    let hit = hit_json(&doc, 4, 128.0, 928.1);
+    let hit = hit_json(&doc, 4, 128.0, 897.26);
     assert_table_hit(&hit, 34, 0);
     assert_nested_inner_cell(&hit, 19);
 }
 
 // =======================================================================
-// pi=34 inner 11x3 — c=2 column 본문 셀들 (외곽 placeholder x_range 안에 들어가 FAIL 예상)
+// pi=34 inner 11x3 — c=2 column 본문 셀들
 // =======================================================================
 
-/// cell[2] r=0,c=2 "국민 주도..." — cell-clip-61 (x=177.6 y=298.0 w=529.9 h=45.1), 중심 (442.5, 320.5)
+/// cell[2] r=0,c=2 "국민 주도..." — cell-clip-61 (x=177.6 y=298.06 w=529.9 h=45.1), 중심 (442.5, 320.56)
 #[test]
 fn page5_inner_11x3_c2_row0_content_cell() {
     let doc = load_doc();
-    let hit = hit_json(&doc, 4, 442.5, 320.5);
+    let hit = hit_json(&doc, 4, 442.5, 320.56);
     assert_table_hit(&hit, 34, 0);
     assert_nested_inner_cell(&hit, 2);
 }
 
-/// cell[3] r=1,c=2 "대국민 소통..." — cell-clip-65 (x=177.6 y=343.1 w=529.9 h=119.9), 중심 (442.5, 403)
+/// cell[3] r=1,c=2 "대국민 소통..." — cell-clip-65 (x=177.6 y=312.26 w=529.9 h=119.9), 중심 (442.5, 372.16)
 #[test]
 fn page5_inner_11x3_c2_row1_content_cell() {
     let doc = load_doc();
-    let hit = hit_json(&doc, 4, 442.5, 403.0);
+    let hit = hit_json(&doc, 4, 442.5, 372.16);
     assert_table_hit(&hit, 34, 0);
     assert_nested_inner_cell(&hit, 3);
 }
 
-/// cell[9] r=3,c=2 "포용과 균형의 기본사회 구현" — cell-clip-91 (x=177.6 y=475.6 w=529.9 h=45.1), 중심 (442.5, 498.1)
+/// cell[9] r=3,c=2 "포용과 균형의 기본사회 구현" — cell-clip-91 (x=177.6 y=475.56 w=529.9 h=45.1), 중심 (442.5, 498.16)
 #[test]
 fn page5_inner_11x3_c2_row3_content_cell() {
     let doc = load_doc();
-    let hit = hit_json(&doc, 4, 442.5, 498.1);
+    let hit = hit_json(&doc, 4, 442.5, 498.16);
     assert_table_hit(&hit, 34, 0);
     assert_nested_inner_cell(&hit, 9);
 }
 
-/// cell[16] r=6,c=2 "성과로 신뢰..." — cell-clip-120 (x=177.6 y=653.1 w=529.9 h=45.1), 중심 (442.5, 675.7)
+/// cell[16] r=6,c=2 "성과로 신뢰..." — cell-clip-120 (x=177.6 y=653.16 w=529.9 h=45.1), 중심 (442.5, 675.66)
 #[test]
 fn page5_inner_11x3_c2_row6_content_cell() {
     let doc = load_doc();
-    let hit = hit_json(&doc, 4, 442.5, 675.7);
+    let hit = hit_json(&doc, 4, 442.5, 675.66);
     assert_table_hit(&hit, 34, 0);
     assert_nested_inner_cell(&hit, 16);
 }
@@ -220,7 +227,7 @@ fn page5_inner_11x3_c2_row6_content_cell() {
 #[test]
 fn page5_inner_11x3_c2_row0_insert_lands_in_inner_cell() {
     let mut doc = load_doc();
-    let hit = hit_json(&doc, 4, 442.5, 320.5);
+    let hit = hit_json(&doc, 4, 442.5, 320.56);
     let path = path_tuples(&hit);
     let parent_para = hit["parentParaIndex"].as_u64().expect("parentParaIndex") as usize;
     let char_offset = hit["charOffset"].as_u64().expect("charOffset") as usize;
