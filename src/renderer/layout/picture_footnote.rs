@@ -14,7 +14,7 @@ use super::super::style_resolver::ResolvedStyleSet;
 use super::super::{hwpunit_to_px, StrokeDash, LineStyle, TextStyle, AutoNumberCounter, format_number, NumberFormat as NumFmt};
 use super::LayoutEngine;
 use super::border_rendering::border_width_to_px;
-use super::utils::find_bin_data;
+use super::utils::{extract_shape_transform, find_bin_data};
 use super::text_measurement::{resolved_to_text_style, estimate_text_width};
 
 impl LayoutEngine {
@@ -45,6 +45,30 @@ impl LayoutEngine {
         section_index: Option<usize>,
         para_index: Option<usize>,
         control_index: Option<usize>,
+    ) {
+        // [Task #825] 본문 picture 경로 — header_footer_ref = None
+        self.layout_picture_full(
+            tree, parent_node, picture, container, bin_data_content, alignment,
+            section_index, para_index, control_index, None,
+        );
+    }
+
+    /// [Task #825] 머리말/꼬리말 picture 전용 — outer Header/Footer 위치 marker 전달.
+    /// `header_footer_ref` 가 `Some` 일 때 ImageNode 에 마커 설정 → rhwp-studio
+    /// 머리말/꼬리말 그림 클릭 hit-test + 개체 속성 dialog dispatch 활성화.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn layout_picture_full(
+        &self,
+        tree: &mut PageRenderTree,
+        parent_node: &mut RenderNode,
+        picture: &crate::model::image::Picture,
+        container: &LayoutRect,
+        bin_data_content: &[BinDataContent],
+        alignment: Alignment,
+        section_index: Option<usize>,
+        para_index: Option<usize>,
+        control_index: Option<usize>,
+        header_footer_ref: Option<crate::renderer::render_tree::HeaderFooterImageRef>,
     ) {
         // 그림 크기 (HWPUNIT → 픽셀)
         // CommonObjAttr의 width/height가 개체의 실제 표시 크기
@@ -131,6 +155,10 @@ impl LayoutEngine {
                 effect: picture.image_attr.effect,
                 brightness: picture.image_attr.brightness,
                 contrast: picture.image_attr.contrast,
+                text_wrap: Some(picture.common.text_wrap),
+                transform: extract_shape_transform(&picture.shape_attr),
+                external_path: picture.image_attr.external_path.clone(),
+                header_footer_ref: header_footer_ref.clone(),
                 ..ImageNode::new(bin_data_id, image_data)
             }),
             BoundingBox::new(pic_x, pic_y, pic_width, pic_height),
@@ -342,6 +370,8 @@ impl LayoutEngine {
                 effect: picture.image_attr.effect,
                 brightness: picture.image_attr.brightness,
                 contrast: picture.image_attr.contrast,
+                text_wrap: Some(picture.common.text_wrap),
+                transform: extract_shape_transform(&picture.shape_attr),
                 ..ImageNode::new(bin_data_id, image_data)
             }),
             BoundingBox::new(adjusted_pic_x, pic_y, pic_width, pic_height),
@@ -394,10 +424,13 @@ impl LayoutEngine {
         // y_offset 업데이트: Para 기준 그림만 높이만큼 진행
         // Page/Paper 기준 그림은 플로팅이므로 y_offset 변경 없음
         // Task #347: 글뒤로/글앞으로 그림은 본문 흐름을 점유하지 않으므로 y 미진행.
+        // base_y는 vert_offset이 적용된 실제 그림 상단 y이므로, base_y + total_height가
+        // 그림 하단 y가 된다. y_offset(앵커 단락 y) 대신 base_y를 기준으로 반환해야
+        // vert_offset이 있는 혼합 단락(텍스트+그림)에서 후속 단락이 그림 위로 겹치지 않는다.
         let total_height = pic_height + caption_height + if caption_height > 0.0 { caption_spacing } else { 0.0 };
         match (picture.common.vert_rel_to, picture.common.text_wrap) {
             (VertRelTo::Para, TextWrap::BehindText | TextWrap::InFrontOfText) => y_offset,
-            (VertRelTo::Para, _) => y_offset + total_height,
+            (VertRelTo::Para, _) => base_y + total_height,
             (VertRelTo::Page | VertRelTo::Paper, _) => y_offset,
         }
     }
@@ -490,6 +523,7 @@ impl LayoutEngine {
                 0,
                 composed.lines.len(),
                 0, 0, ctx, false, 0.0, None, None, None,
+                None,  // 캡션 컨텍스트 — wrap zone 무관
             );
         }
     }
@@ -609,6 +643,7 @@ impl LayoutEngine {
                     let returned_y = self.layout_composed_paragraph(
                         tree, fn_node, &composed, styles, fn_area, y, 0, composed.lines.len(),
                         marker_section, marker_para, None, false, 0.0, None, None, None,
+                        None,  // 각주 컨텍스트 — wrap zone 무관
                     );
                     if is_last_para_of_fn {
                         // layout_composed_paragraph 가 마지막 line 의 trailing line_spacing 을

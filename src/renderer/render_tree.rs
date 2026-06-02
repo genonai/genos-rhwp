@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::model::{ColorRef, Rect};
 use crate::model::style::ImageFillMode;
 use crate::model::image::ImageEffect;
+use crate::model::shape::TextWrap;
 use super::{TextStyle, ShapeStyle, LineStyle, PathCommand, GradientFillInfo};
 use super::composer::CharOverlapInfo;
 use super::layout::CellContext;
@@ -647,6 +648,43 @@ pub struct ImageNode {
     pub brightness: i8,
     /// 명암(대비) (-100 ~ +100)
     pub contrast: i8,
+    /// 텍스트 흐름 wrap 모드 (Task #516, 다층 레이어 분리용).
+    /// `None` 또는 `Some(Square/TopAndBottom/Tight/Through)` 는 본문 layer 에 포함되고,
+    /// `Some(BehindText)` / `Some(InFrontOfText)` 는 overlay layer 로 분리 후보.
+    /// 기본값 `None` 은 기존 동작 유지.
+    pub text_wrap: Option<TextWrap>,
+    /// [Task #741] 외부 file path 그림 (HWP3 spec offset 74 그림 종류 0=외부 파일,
+    /// 1=OLE, 2=Embedded Image / offset 83~339 그림 파일 이름).
+    /// `data` 가 `None` 이고 `external_path` 가 `Some` 인 경우 placeholder 표시
+    /// (점선 사각형 + 깨진 image 아이콘) — 한컴 한글 2024 viewer 정합.
+    #[serde(default)]
+    pub external_path: Option<String>,
+    /// [Task #825] 머리말/꼬리말 그림 식별 marker.
+    /// `Some(ref)` 일 때 본 ImageNode 는 머리말 또는 꼬리말 안에 위치하며,
+    /// `para_index` / `control_index` 는 `Header.paragraphs[]` / `Footer.paragraphs[]`
+    /// 의 inner 인덱스를 가리킨다. `outer` 는 본문 paragraph 의 Header/Footer 컨트롤
+    /// 위치 (body_para_idx + header_ctrl_idx) 를 보존.
+    /// `None` 일 때 본문 그림 (현행 동작).
+    #[serde(default)]
+    pub header_footer_ref: Option<HeaderFooterImageRef>,
+}
+
+/// [Task #825] 머리말/꼬리말 안 그림의 outer 위치 + 종류.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct HeaderFooterImageRef {
+    /// 본문 paragraph 인덱스 (Header/Footer 컨트롤 소속 paragraph)
+    pub outer_para_index: usize,
+    /// 본문 paragraph 안 Header/Footer 컨트롤 인덱스
+    pub outer_control_index: usize,
+    /// "header" or "footer"
+    pub kind: HeaderFooterKind,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HeaderFooterKind {
+    Header,
+    Footer,
 }
 
 impl ImageNode {
@@ -661,6 +699,9 @@ impl ImageNode {
             effect: ImageEffect::RealPic,
             brightness: 0,
             contrast: 0,
+            text_wrap: None,
+            external_path: None,
+            header_footer_ref: None,
         }
     }
 }
@@ -701,6 +742,13 @@ pub struct EquationNode {
     pub cell_para_index: Option<usize>,
 }
 
+/// 인라인 Shape 좌표 맵 키. 섹션 단위 + 셀 경로로 셀 내 paragraph/control
+/// 인덱스 충돌(예: 서로 다른 셀이 cp_idx=0 + ctrl_idx=N 동일)을 방지한다.
+///
+/// `cell_path` 는 외→내 nesting 순서로 `(control_index, cell_index, cell_para_index)`
+/// 튜플 목록. 섹션 단위(셀 외부)는 빈 Vec.
+pub type InlineShapeKey = (usize, usize, usize, Vec<(usize, usize, usize)>);
+
 /// 한 페이지의 렌더 트리
 #[derive(Debug, Clone, Serialize)]
 pub struct PageRenderTree {
@@ -709,9 +757,9 @@ pub struct PageRenderTree {
     /// 다음 노드 ID 카운터
     #[serde(skip)]
     next_id: NodeId,
-    /// 인라인 Shape 좌표 맵: (section, para, control) → (x, y)
+    /// 인라인 Shape 좌표 맵: (section, para, control, cell_path) → (x, y)
     #[serde(skip)]
-    inline_shape_positions: std::collections::HashMap<(usize, usize, usize), (f64, f64)>,
+    inline_shape_positions: std::collections::HashMap<InlineShapeKey, (f64, f64)>,
 }
 
 impl PageRenderTree {
@@ -730,18 +778,43 @@ impl PageRenderTree {
         Self { root, next_id: 1, inline_shape_positions: std::collections::HashMap::new() }
     }
 
-    /// 인라인 Shape 좌표 등록
-    pub fn set_inline_shape_position(&mut self, sec: usize, para: usize, ctrl: usize, x: f64, y: f64) {
-        self.inline_shape_positions.insert((sec, para, ctrl), (x, y));
+    /// `CellContext` 를 InlineShapeKey 의 cell_path 부분으로 변환.
+    fn cell_path_from_ctx(cell_ctx: Option<&crate::renderer::layout::CellContext>) -> Vec<(usize, usize, usize)> {
+        cell_ctx.map(|ctx| {
+            ctx.path.iter()
+                .map(|e| (e.control_index, e.cell_index, e.cell_para_index))
+                .collect()
+        }).unwrap_or_default()
     }
 
-    /// 인라인 Shape 좌표 조회
-    pub fn get_inline_shape_position(&self, sec: usize, para: usize, ctrl: usize) -> Option<(f64, f64)> {
-        self.inline_shape_positions.get(&(sec, para, ctrl)).copied()
+    /// 인라인 Shape 좌표 등록 (셀 컨텍스트 포함)
+    pub fn set_inline_shape_position(
+        &mut self,
+        sec: usize,
+        para: usize,
+        ctrl: usize,
+        cell_ctx: Option<&crate::renderer::layout::CellContext>,
+        x: f64,
+        y: f64,
+    ) {
+        let cell_path = Self::cell_path_from_ctx(cell_ctx);
+        self.inline_shape_positions.insert((sec, para, ctrl, cell_path), (x, y));
+    }
+
+    /// 인라인 Shape 좌표 조회 (셀 컨텍스트 포함)
+    pub fn get_inline_shape_position(
+        &self,
+        sec: usize,
+        para: usize,
+        ctrl: usize,
+        cell_ctx: Option<&crate::renderer::layout::CellContext>,
+    ) -> Option<(f64, f64)> {
+        let cell_path = Self::cell_path_from_ctx(cell_ctx);
+        self.inline_shape_positions.get(&(sec, para, ctrl, cell_path)).copied()
     }
 
     /// 인라인 Shape 좌표 전체 참조 (hitTest용)
-    pub fn inline_shape_positions(&self) -> &std::collections::HashMap<(usize, usize, usize), (f64, f64)> {
+    pub fn inline_shape_positions(&self) -> &std::collections::HashMap<InlineShapeKey, (f64, f64)> {
         &self.inline_shape_positions
     }
 

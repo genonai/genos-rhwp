@@ -87,7 +87,7 @@ export const viewCommands: CommandDef[] = [
       document.querySelectorAll('[data-cmd="view:para-mark"]').forEach(el => {
         el.classList.toggle('active', next);
       });
-      services.eventBus.emit('document-changed');
+      services.eventBus.emit('document-view-changed');
     },
   },
   (() => {
@@ -103,7 +103,7 @@ export const viewCommands: CommandDef[] = [
         document.querySelectorAll('[data-cmd="view:para-mark"]').forEach(el => {
           el.classList.toggle('active', showParaMarks);
         });
-        services.eventBus.emit('document-changed');
+        services.eventBus.emit('document-view-changed');
       },
     } satisfies CommandDef;
   })(),
@@ -119,7 +119,7 @@ export const viewCommands: CommandDef[] = [
         el.classList.toggle('active', next);
       });
       services.eventBus.emit('transparent-borders-changed', next);
-      services.eventBus.emit('document-changed');
+      services.eventBus.emit('document-view-changed');
     },
   },
   (() => {
@@ -134,7 +134,7 @@ export const viewCommands: CommandDef[] = [
         document.querySelectorAll('[data-cmd="view:toggle-clip"]').forEach(el => {
           el.classList.toggle('active', !clipEnabled);
         });
-        services.eventBus.emit('document-changed');
+        services.eventBus.emit('document-view-changed');
       },
     } satisfies CommandDef;
   })(),
@@ -149,16 +149,38 @@ export const viewCommands: CommandDef[] = [
       new GridSettingsDialog(ih.getGridStepMm(), (mm) => ih.setGridStep(mm)).show();
     },
   },
-  {
-    id: 'view:toolbox-basic',
-    label: '기본',
-    canExecute: () => false,
-    execute() { /* TODO */ },
-  },
-  {
-    id: 'view:toolbox-format',
-    label: '서식',
-    canExecute: () => false,
-    execute() { /* TODO */ },
-  },
+  (() => {
+    let visible: boolean | null = null;
+    return {
+      id: 'view:toolbox-basic',
+      label: '기본',
+      execute() {
+        const el = document.getElementById('icon-toolbar');
+        if (!el) return;
+        if (visible === null) visible = getComputedStyle(el).display !== 'none';
+        visible = !visible;
+        el.style.display = visible ? '' : 'none';
+        document.querySelectorAll('[data-cmd="view:toolbox-basic"]').forEach(btn => {
+          btn.classList.toggle('active', visible!);
+        });
+      },
+    } satisfies CommandDef;
+  })(),
+  (() => {
+    let visible: boolean | null = null;
+    return {
+      id: 'view:toolbox-format',
+      label: '서식',
+      execute() {
+        const el = document.getElementById('style-bar');
+        if (!el) return;
+        if (visible === null) visible = getComputedStyle(el).display !== 'none';
+        visible = !visible;
+        el.style.display = visible ? '' : 'none';
+        document.querySelectorAll('[data-cmd="view:toolbox-format"]').forEach(btn => {
+          btn.classList.toggle('active', visible!);
+        });
+      },
+    } satisfies CommandDef;
+  })(),
 ];

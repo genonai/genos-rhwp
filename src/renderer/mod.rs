@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::model::style::{LineSpacingType, UnderlineType};
 
 pub mod canvas;
+pub mod canvaskit_policy;
 pub mod composer;
 pub mod equation;
 pub mod font_metrics_data;
@@ -18,6 +19,7 @@ pub mod layout;
 pub mod page_layout;
 pub mod page_number;
 pub mod pagination;
+pub mod pua_oldhangul;
 pub mod render_tree;
 pub mod scheduler;
 pub mod style_resolver;
@@ -26,6 +28,8 @@ pub mod svg_fragment;
 pub mod svg_layer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod pdf;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+pub mod skia;
 pub mod typeset;
 #[cfg(target_arch = "wasm32")]
 pub mod web_canvas;
@@ -108,6 +112,19 @@ pub struct TextStyle {
     pub available_width: f64,
     /// 단 시작으로부터 run 시작 위치 (탭 절대좌표 변환용)
     pub line_x_offset: f64,
+    /// 단 시작으로부터 텍스트 영역 시작 위치 (effective_margin_left, px).
+    /// auto_tab_right 의 col-relative 위치 = text_start_offset + available_width.
+    /// [Task #874] 종전 find_next_tab_stop 의 auto_right 반환값(=available_width) 은
+    /// 텍스트-시작-상대 좌표였으나, 호출자(compute_char_positions / pending_right_tab)
+    /// 가 col-relative 로 해석해 effective_margin_left 만큼 좌측으로 밀린 정렬 발생.
+    /// 본 필드로 변환 보정.
+    pub text_start_offset: f64,
+    /// auto_tab_right + 다음 run-경계 cross 시 우측 정렬 블록의 총 폭 (px).
+    /// composer 가 lang/script 경계로 run 을 쪼개면 (예: "F3→Alt+I" → "F3"/"→"/"Alt+I")
+    /// `measure_segment_from` 이 현재 run 의 post-tab chars 만 측정하여 seg_w 가
+    /// 과소되고, 우측 정렬이 무너진다. paragraph_layout 에서 line 내 후속 runs 합산
+    /// 을 미리 계산해 주입한다. None 이면 기존 동작 (현재 run 내부 측정).
+    pub right_tab_block_width_override: Option<f64>,
     /// 탭 리더 정보 (compute_char_positions 후 채움)
     pub tab_leaders: Vec<TabLeaderInfo>,
     /// HWPX 인라인 탭 확장 데이터 ([width, leader, type, ...])
@@ -162,6 +179,11 @@ impl TextStyle {
     pub fn is_visually_bold(&self) -> bool {
         self.bold || crate::renderer::style_resolver::is_heavy_display_face(&self.font_family)
     }
+
+    /// 중고딕 계열(font-weight 500) 여부. SVG/HTML 출력 시 `font-weight: 500` 힌트 삽입에 사용.
+    pub fn is_medium_weight(&self) -> bool {
+        !self.bold && crate::renderer::style_resolver::is_medium_weight_face(&self.font_family)
+    }
 }
 
 impl Default for TextStyle {
@@ -181,6 +203,8 @@ impl Default for TextStyle {
             auto_tab_right: false,
             available_width: 0.0,
             line_x_offset: 0.0,
+            text_start_offset: 0.0,
+            right_tab_block_width_override: None,
             tab_leaders: Vec::new(),
             inline_tabs: Vec::new(),
             extra_word_spacing: 0.0,
@@ -549,13 +573,14 @@ pub fn px_to_hwpunit(px: f64, dpi: f64) -> i32 {
 pub fn generic_fallback(font_family: &str) -> &'static str {
     if font_family.is_empty() {
         // Sans-serif: Windows → macOS/iOS → Android → 오픈소스 → generic
-        return "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard',sans-serif";
+        return "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard','Source Han Serif K Old Hangul',sans-serif";
     }
     // 고정폭 키워드
     let lower = font_family.to_ascii_lowercase();
     if font_family.contains("굴림체") || font_family.contains("바탕체")
         || lower.contains("gulimche") || lower.contains("batangche")
         || lower.contains("coding") || lower.contains("courier")
+        || lower.contains("mono")
     {
         // Monospace: Windows → 오픈소스 → generic
         return "'GulimChe','굴림체','D2Coding','Noto Sans Mono',monospace";
@@ -567,17 +592,21 @@ pub fn generic_fallback(font_family: &str) -> &'static str {
         // Serif: Windows → macOS(Bold 보유 우선) → macOS 기본 → Android → 오픈소스 → 리눅스 시스템 → generic
         // Nanum Myeongjo 는 macOS 10.9+ 기본 설치이며 Bold variant 보유.
         // AppleMyungjo 보다 앞에 두어야 macOS Chrome 에서 CJK 글리프 bold 매칭 성공.
-        return "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR',serif";
+        // 'Source Han Serif K Old Hangul' (Task #528): @font-face unicode-range 가 옛한글
+        // 영역 (U+1100-11FF, U+A960-A97F, U+D7B0-D7FF) 만 매칭하므로 일반 한글에 영향 없음.
+        return "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR','Source Han Serif K Old Hangul',serif";
     }
-    // 세리프 키워드 (영문)
+    // 세리프 키워드 (영문) — "serif" 포함하되 "sans" 부분 문자열을 가진 폰트명 전체 제외
     if lower.contains("times") || lower.contains("hymjre")
         || lower.contains("palatino") || lower.contains("georgia")
         || lower.contains("batang") || lower.contains("gungsuh")
+        || (lower.contains("serif") && !lower.contains("sans"))
     {
-        return "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR',serif";
+        return "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR','Source Han Serif K Old Hangul',serif";
     }
     // Sans-serif: Windows → macOS/iOS → Android → 오픈소스 → generic
-    "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard',sans-serif"
+    // 'Source Han Serif K Old Hangul' (Task #528): unicode-range 옛한글 자모 영역 한정
+    "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard','Source Han Serif K Old Hangul',sans-serif"
 }
 
 // ============================================================
@@ -944,8 +973,8 @@ mod tests {
 
     #[test]
     fn test_generic_fallback() {
-        let serif = "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR',serif";
-        let sans = "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard',sans-serif";
+        let serif = "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR','Source Han Serif K Old Hangul',serif";
+        let sans = "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard','Source Han Serif K Old Hangul',sans-serif";
         let mono = "'GulimChe','굴림체','D2Coding','Noto Sans Mono',monospace";
         // 세리프 계열
         assert_eq!(generic_fallback("함초롬바탕"), serif);
@@ -964,8 +993,32 @@ mod tests {
         assert_eq!(generic_fallback("굴림체"), mono);
         assert_eq!(generic_fallback("바탕체"), mono);
         assert_eq!(generic_fallback("Courier New"), mono);
+        assert_eq!(generic_fallback("D2Coding ligature"), mono);
+        assert_eq!(generic_fallback("Noto Sans Mono"), mono);
+        // 영문 세리프 (issue #616)
+        assert_eq!(generic_fallback("Noto Serif CJK SC"), serif);
+        assert_eq!(generic_fallback("Liberation Serif"), serif);
+        assert_eq!(generic_fallback("Noto Serif KR"), serif);
+        // "sans" 포함 폰트는 세리프로 분류되지 않음
+        assert_eq!(generic_fallback("Liberation Sans"), sans);
+        assert_eq!(generic_fallback("Noto Sans KR"), sans);
         // 빈 문자열
         assert_eq!(generic_fallback(""), sans);
+    }
+
+    #[test]
+    fn test_medium_weight_face() {
+        use crate::renderer::style_resolver::is_medium_weight_face;
+        assert!(is_medium_weight_face("HY중고딕"));
+        assert!(is_medium_weight_face("신명 중고딕"));
+        assert!(is_medium_weight_face("한양중고딕"));
+        assert!(is_medium_weight_face("HY태고딕"));
+        assert!(is_medium_weight_face("신명 태고딕"));
+        assert!(!is_medium_weight_face("HY헤드라인M"));
+        assert!(!is_medium_weight_face("돋움"));
+        assert!(!is_medium_weight_face("바탕"));
+        assert!(!is_medium_weight_face("맑은 고딕"));
+        assert!(!is_medium_weight_face(""));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 /** input-handler picture/shape methods — extracted from InputHandler class */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-import { MovePictureCommand, MoveShapeCommand } from './command';
+import { MovePictureCommand, MoveShapeCommand, ResizeObjectCommand } from './command';
 
 /** 클릭 좌표에서 그림, 글상자, 수식 개체를 찾는다. */
 /** 점과 선분 사이 최소 거리 (px) */
@@ -16,12 +16,24 @@ function pointToSegmentDist(px: number, py: number, x1: number, y1: number, x2: 
 
 export function findPictureAtClick(this: any,
   pageIdx: number, pageX: number, pageY: number,
-): { sec: number; ppi: number; ci: number; type: 'image' | 'shape' | 'equation' | 'group' | 'line'; cellIdx?: number; cellParaIdx?: number; x1?: number; y1?: number; x2?: number; y2?: number } | null {
+): { sec: number; ppi: number; ci: number; type: 'image' | 'shape' | 'equation' | 'group' | 'line'; cellIdx?: number; cellParaIdx?: number; x1?: number; y1?: number; x2?: number; y2?: number; headerFooter?: { kind: 'header' | 'footer'; outerParaIdx: number; outerControlIdx: number } } | null {
   try {
     const layout = this.wasm.getPageControlLayout(pageIdx);
+    // Task #516 결함 3 (옵션 3-C): BehindText 그림은 텍스트 영역 위에서는 후순위.
+    // 1차 패스: BehindText 가 아닌 그림 우선 hit-test.
+    // 2차 패스: BehindText 그림은 텍스트 hit-test 결과가 비어 있을 때만 hit.
+    const behindCtrls: any[] = [];
     for (const ctrl of layout.controls) {
       if (ctrl.type !== 'image' && ctrl.type !== 'shape' && ctrl.type !== 'equation' && ctrl.type !== 'group' && ctrl.type !== 'line') continue;
       if (ctrl.secIdx === undefined || ctrl.paraIdx === undefined || ctrl.controlIdx === undefined) continue;
+      // [Task #825] 머리말/꼬리말 그림: headerFooter marker 가 함께 있어야 lookup 가능.
+      // (없으면 본문 picture 동작 그대로.)
+
+      // BehindText 그림은 1차 패스 건너뛰고 2차 패스로 보류
+      if (ctrl.wrap === 'behindText') {
+        behindCtrls.push(ctrl);
+        continue;
+      }
 
       if (ctrl.type === 'line') {
         // 직선: 점-선분 거리, 연결선: 곡선 경로 샘플링으로 히트 판정
@@ -71,7 +83,31 @@ export function findPictureAtClick(this: any,
         // bbox 히트 판정
         if (pageX >= ctrl.x && pageX <= ctrl.x + ctrl.w &&
             pageY >= ctrl.y && pageY <= ctrl.y + ctrl.h) {
-          return { sec: ctrl.secIdx, ppi: ctrl.paraIdx, ci: ctrl.controlIdx, type: ctrl.type, cellIdx: ctrl.cellIdx, cellParaIdx: ctrl.cellParaIdx };
+          return { sec: ctrl.secIdx, ppi: ctrl.paraIdx, ci: ctrl.controlIdx, type: ctrl.type, cellIdx: ctrl.cellIdx, cellParaIdx: ctrl.cellParaIdx, headerFooter: ctrl.headerFooter };
+        }
+      }
+    }
+    // 2차 패스: BehindText 그림 hit-test (옵션 3-C, Task #516).
+    // 텍스트 hit-test 결과를 확인하여 텍스트가 있는 위치면 그림 hit 무시.
+    // 텍스트가 없는 영역 (예: 빈 줄, 페이지 여백) 에서는 BehindText 그림 hit 허용.
+    if (behindCtrls.length > 0) {
+      let textHit = false;
+      try {
+        const ht = this.wasm.hitTest(pageIdx, pageX, pageY);
+        // ht 가 유효하고 charOffset 이 텍스트 영역 안 (charOffset > 0 또는 paragraphIndex 가
+        // 그림이 attach 된 빈 문단이 아님) 이면 텍스트 hit 으로 간주.
+        // 보수적: ht 가 null/undefined 가 아니면 텍스트 영역으로 간주.
+        if (ht && typeof ht.charOffset === 'number' && ht.charOffset > 0) {
+          textHit = true;
+        }
+      } catch { /* hitTest 실패 시 그림 hit 허용 */ }
+
+      if (!textHit) {
+        for (const ctrl of behindCtrls) {
+          if (pageX >= ctrl.x && pageX <= ctrl.x + ctrl.w &&
+              pageY >= ctrl.y && pageY <= ctrl.y + ctrl.h) {
+            return { sec: ctrl.secIdx, ppi: ctrl.paraIdx, ci: ctrl.controlIdx, type: ctrl.type, cellIdx: ctrl.cellIdx, cellParaIdx: ctrl.cellParaIdx, headerFooter: ctrl.headerFooter };
+          }
         }
       }
     }
@@ -191,11 +227,16 @@ export function renderPictureObjectSelection(this: any): void {
 
           const bx = ctrl.x, by = ctrl.y, bw = ctrl.w, bh = ctrl.h;
 
-          // 회전각 조회 (shape만)
+          // 회전각 조회 (shape + image)
           let rotAngle = 0;
           if (ref.type === 'shape') {
             try {
               const props = this.wasm.getShapeProperties(ref.sec, ref.ppi, ref.ci);
+              rotAngle = (props.rotationAngle as number) ?? 0;
+            } catch { /* ignore */ }
+          } else if (ref.type === 'image') {
+            try {
+              const props = this.wasm.getPictureProperties(ref.sec, ref.ppi, ref.ci);
               rotAngle = (props.rotationAngle as number) ?? 0;
             } catch { /* ignore */ }
           }
@@ -260,6 +301,8 @@ export function setObjectProperties(this: any, ref: { sec: number; ppi: number; 
 export function deleteObjectControl(this: any, ref: { sec: number; ppi: number; ci: number; type: 'image' | 'shape' | 'equation' | 'group' | 'line' }): void {
   if (ref.type === 'shape' || ref.type === 'group' || ref.type === 'line') {
     this.wasm.deleteShapeControl(ref.sec, ref.ppi, ref.ci);
+  } else if (ref.type === 'equation') {
+    this.wasm.deleteEquationControl(ref.sec, ref.ppi, ref.ci);
   } else {
     this.wasm.deletePictureControl(ref.sec, ref.ppi, ref.ci);
   }
@@ -418,6 +461,7 @@ export function finishPictureResizeDrag(this: any, e: MouseEvent): void {
     const isCorner = ['nw', 'ne', 'sw', 'se'].includes(state.dir);
 
     try {
+      const historyTargets = [];
       for (const r of state.multiRefs) {
         const relX = r.bboxX - origX;
         const relY = r.bboxY - origY;
@@ -430,9 +474,22 @@ export function finishPictureResizeDrag(this: any, e: MouseEvent): void {
         const newW = Math.max(Math.round(r.origWidth * sx), MIN_SIZE_HWP);
         const newH = Math.max(Math.round(r.origHeight * sy), MIN_SIZE_HWP);
         const updated: Record<string, unknown> = { width: newW, height: newH };
-        if (deltaH !== 0) updated['horzOffset'] = ((r.origHorzOffset + deltaH) >>> 0);
-        if (deltaV !== 0) updated['vertOffset'] = ((r.origVertOffset + deltaV) >>> 0);
+        const before: Record<string, unknown> = { width: r.origWidth, height: r.origHeight };
+        if (deltaH !== 0) {
+          updated['horzOffset'] = ((r.origHorzOffset + deltaH) >>> 0);
+          before['horzOffset'] = r.origHorzOffset;
+        }
+        if (deltaV !== 0) {
+          updated['vertOffset'] = ((r.origVertOffset + deltaV) >>> 0);
+          before['vertOffset'] = r.origVertOffset;
+        }
+        const changed = Object.keys(updated).some(key => updated[key] !== before[key]);
+        if (!changed) continue;
         setObjectProperties.call(this, r, updated);
+        historyTargets.push({ sec: r.sec, ppi: r.ppi, ci: r.ci, type: r.type, before, after: updated });
+      }
+      if (historyTargets.length > 0) {
+        this.executeOperation({ kind: 'record', command: new ResizeObjectCommand(historyTargets) });
       }
       this.eventBus.emit('document-changed');
     } catch (err) {
@@ -454,12 +511,31 @@ export function finishPictureResizeDrag(this: any, e: MouseEvent): void {
 
   try {
     const updated: Record<string, unknown> = {};
-    if (newW !== state.origWidth) updated['width'] = newW;
-    if (newH !== state.origHeight) updated['height'] = newH;
-    if (newHorzOffset !== origHorzOffset) updated['horzOffset'] = (newHorzOffset >>> 0);
-    if (newVertOffset !== origVertOffset) updated['vertOffset'] = (newVertOffset >>> 0);
+    const before: Record<string, unknown> = {};
+    if (newW !== state.origWidth) {
+      updated['width'] = newW;
+      before['width'] = state.origWidth;
+    }
+    if (newH !== state.origHeight) {
+      updated['height'] = newH;
+      before['height'] = state.origHeight;
+    }
+    const beforeHorzOffset = state.origHorzOffset ?? origHorzOffset;
+    const beforeVertOffset = state.origVertOffset ?? origVertOffset;
+    if (newHorzOffset !== origHorzOffset) {
+      updated['horzOffset'] = (newHorzOffset >>> 0);
+      before['horzOffset'] = beforeHorzOffset;
+    }
+    if (newVertOffset !== origVertOffset) {
+      updated['vertOffset'] = (newVertOffset >>> 0);
+      before['vertOffset'] = beforeVertOffset;
+    }
     if (Object.keys(updated).length > 0) {
       setObjectProperties.call(this, state.ref, updated);
+      this.executeOperation({
+        kind: 'record',
+        command: new ResizeObjectCommand([{ sec: state.ref.sec, ppi: state.ref.ppi, ci: state.ref.ci, type: state.ref.type, before, after: updated }]),
+      });
       this.eventBus.emit('document-changed');
     }
   } catch (err) {
@@ -524,10 +600,10 @@ export function updatePictureMoveDrag(this: any, e: MouseEvent): void {
   const cr = sc.getBoundingClientRect();
   const cx = e.clientX - cr.left;
   const cy = e.clientY - cr.top;
-  const pi = this.virtualScroll.getPageAtY(cy);
+  const pi = this.virtualScroll.getPageAtPoint(cx, cy);
   const po = this.virtualScroll.getPageOffset(pi);
   const pw = this.virtualScroll.getPageWidth(pi);
-  const pl = (sc.clientWidth - pw) / 2;
+  const pl = this.virtualScroll.getPageLeftResolved(pi, sc.clientWidth);
   const px = (cx - pl) / zoom;
   const py = (cy - po) / zoom;
 

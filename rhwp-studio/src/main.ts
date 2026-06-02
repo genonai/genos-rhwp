@@ -9,7 +9,7 @@ import { loadWebFonts } from '@/core/font-loader';
 import { CommandRegistry } from '@/command/registry';
 import { CommandDispatcher } from '@/command/dispatcher';
 import type { EditorContext, CommandServices } from '@/command/types';
-import { fileCommands } from '@/command/commands/file';
+import { confirmSaveBeforeReplacingDocument, fileCommands } from '@/command/commands/file';
 import { editCommands } from '@/command/commands/edit';
 import { viewCommands } from '@/command/commands/view';
 import { formatCommands } from '@/command/commands/format';
@@ -21,6 +21,8 @@ import { ContextMenu } from '@/ui/context-menu';
 import { CommandPalette } from '@/ui/command-palette';
 import { showValidationModalIfNeeded } from '@/ui/validation-modal';
 import { showToast } from '@/ui/toast';
+import { initRhwpDev } from '@/core/rhwp-dev';
+import { DocumentDirtyState } from '@/core/document-dirty-state';
 import { CellSelectionRenderer } from '@/engine/cell-selection-renderer';
 import { TableObjectRenderer } from '@/engine/table-object-renderer';
 import { TableResizeRenderer } from '@/engine/table-resize-renderer';
@@ -28,11 +30,15 @@ import { Ruler } from '@/view/ruler';
 
 const wasm = new WasmBridge();
 const eventBus = new EventBus();
+const documentState = new DocumentDirtyState(eventBus);
+documentState.installBeforeUnload(window);
 
 // E2E 테스트용 전역 노출 (개발 모드 전용)
 if (import.meta.env.DEV) {
   (window as any).__wasm = wasm;
   (window as any).__eventBus = eventBus;
+  (window as any).__documentState = documentState;
+  initRhwpDev(wasm);
 }
 let canvasView: CanvasView | null = null;
 let inputHandler: InputHandler | null = null;
@@ -58,6 +64,7 @@ function getContext(): EditorContext {
     canRedo: inputHandler?.canRedo() ?? false,
     zoom: canvasView?.getViewportManager().getZoom() ?? 1.0,
     showControlCodes: wasm.getShowControlCodes(),
+    isDirty: documentState.isDirty(),
     sourceFormat: hasDoc ? (wasm.getSourceFormat() as 'hwp' | 'hwpx') : undefined,
   };
 }
@@ -65,6 +72,7 @@ function getContext(): EditorContext {
 const commandServices: CommandServices = {
   eventBus,
   wasm,
+  documentState,
   getContext,
   getInputHandler: () => inputHandler,
   getViewportManager: () => canvasView?.getViewportManager() ?? null,
@@ -95,6 +103,9 @@ async function initialize(): Promise<void> {
     await loadWebFonts([]);  // CSS @font-face 등록 + CRITICAL 폰트만 로드
     msg.textContent = 'WASM 로딩 중...';
     await wasm.initialize();
+    if (import.meta.env.DEV) {
+      initRhwpDev(wasm);
+    }
     msg.textContent = 'HWP 파일을 선택해주세요.';
 
     const container = document.getElementById('scroll-container')!;
@@ -176,6 +187,17 @@ async function initialize(): Promise<void> {
       document.querySelectorAll('.tb-split.open').forEach(s => s.classList.remove('open'));
     });
 
+    // #780: 도구 모음/서식 도구 모음 영역 mousedown 시 focus 이동 방지
+    // — 편집 영역의 텍스트 선택(cursor.anchor)이 보존되어야 서식 적용이 동작함
+    for (const id of ['icon-toolbar', 'style-bar']) {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('mousedown', (e) => {
+        if ((e.target as HTMLElement).tagName !== 'INPUT' && (e.target as HTMLElement).tagName !== 'SELECT') {
+          e.preventDefault();
+        }
+      });
+    }
+
     setupFileInput();
     setupZoomControls();
     setupEventListeners();
@@ -215,6 +237,14 @@ function setupGlobalShortcuts(): void {
         return;
       }
     }
+    // Ctrl/Cmd+O → 열기 (문서 미로드 상태에서도 동작)
+    if (ctrlOrMeta && !e.altKey && !e.shiftKey) {
+      if (e.key === 'o' || e.key === 'O' || e.key === 'ㅐ') {
+        e.preventDefault();
+        dispatcher.dispatch('file:open');
+        return;
+      }
+    }
   }, false);
 }
 
@@ -222,14 +252,19 @@ function setupFileInput(): void {
   const fileInput = document.getElementById('file-input') as HTMLInputElement;
 
   fileInput.addEventListener('change', async (e) => {
-    const file = (e.target as HTMLInputElement).files?.[0];
+    const input = e.target as HTMLInputElement;
+    const skipUnsavedGuard = input.dataset.skipUnsavedGuard === 'true';
+    delete input.dataset.skipUnsavedGuard;
+    const file = input.files?.[0];
     if (!file) return;
     const name = file.name.toLowerCase();
     if (!name.endsWith('.hwp') && !name.endsWith('.hwpx')) {
       alert('HWP/HWPX 파일만 지원합니다.');
+      fileInput.value = '';
       return;
     }
-    await loadFile(file);
+    await loadFile(file, { skipUnsavedGuard });
+    fileInput.value = '';
   });
 
   // 문서 전체에서 브라우저 기본 드롭 동작 방지 (파일 열기/다운로드 방지)
@@ -251,8 +286,26 @@ function setupFileInput(): void {
     const file = e.dataTransfer?.files[0];
     if (!file) return;
     const dropName = file.name.toLowerCase();
+    const imageExts = ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'];
+    if (imageExts.some(ext => dropName.endsWith(ext))) {
+      if (!inputHandler || wasm.pageCount === 0) return;
+      const data = new Uint8Array(await file.arrayBuffer());
+      const ext = file.name.split('.').pop()?.toLowerCase() || 'png';
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      try {
+        img.src = url;
+        await img.decode();
+        inputHandler.enterImagePlacementMode(data, ext, img.naturalWidth, img.naturalHeight, file.name);
+      } catch {
+        console.warn('[drop] 이미지 디코딩 실패:', file.name);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+      return;
+    }
     if (!dropName.endsWith('.hwp') && !dropName.endsWith('.hwpx')) {
-      alert('HWP/HWPX 파일만 지원합니다.');
+      alert('HWP/HWPX 파일 또는 이미지 파일만 지원합니다.');
       return;
     }
     await loadFile(file);
@@ -348,6 +401,18 @@ function setupEventListeners(): void {
     document.getElementById('sb-mode')!.textContent = (insertMode as boolean) ? '삽입' : '수정';
   });
 
+  eventBus.on('document-mutated', (reason) => {
+    documentState.markDirty(typeof reason === 'string' ? reason : 'document-mutated');
+  });
+
+  eventBus.on('document-changed', (reason) => {
+    documentState.markDirty(typeof reason === 'string' ? reason : 'document-changed');
+  });
+
+  eventBus.on('document-dirty-changed', () => {
+    eventBus.emit('command-state-changed');
+  });
+
   // 필드 정보 표시
   const sbField = document.getElementById('sb-field');
   eventBus.on('field-info-changed', (info) => {
@@ -405,6 +470,7 @@ function setupEventListeners(): void {
 /** 문서 초기화 공통 시퀀스 (loadFile, createNewDocument 양쪽에서 사용) */
 async function initializeDocument(docInfo: DocumentInfo, displayName: string): Promise<void> {
   const msg = sbMessage();
+  let normalizedDuringLoad = false;
   try {
     console.log('[initDoc] 1. 폰트 로딩 시작');
     if (docInfo.fontsUsed?.length) {
@@ -422,7 +488,8 @@ async function initializeDocument(docInfo: DocumentInfo, displayName: string): P
     canvasView?.loadDocument();
     console.log('[initDoc] 5. toolbar setEnabled');
     toolbar?.setEnabled(true);
-    console.log('[initDoc] 6. toolbar initStyleDropdown');
+    console.log('[initDoc] 6. toolbar initFontDropdown + initStyleDropdown');
+    toolbar?.initFontDropdown(docInfo.fontsUsed);
     toolbar?.initStyleDropdown();
     console.log('[initDoc] 7. inputHandler activateWithCaretPosition');
     inputHandler?.activateWithCaretPosition();
@@ -441,10 +508,16 @@ async function initializeDocument(docInfo: DocumentInfo, displayName: string): P
           // 렌더 재계산
           canvasView?.loadDocument();
           msg.textContent = `${displayName} (비표준 lineseg ${n}건 자동 보정됨)`;
+          normalizedDuringLoad = n > 0;
         }
       }
     } catch (e) {
       console.warn('[validation] 감지/보정 실패 (치명적이지 않음):', e);
+    }
+    if (normalizedDuringLoad) {
+      documentState.markDirty('validation-auto-fix');
+    } else {
+      documentState.markClean('document-initialized');
     }
   } catch (error) {
     console.error('[initDoc] 오류:', error);
@@ -452,15 +525,21 @@ async function initializeDocument(docInfo: DocumentInfo, displayName: string): P
   }
 }
 
-async function loadFile(file: File): Promise<void> {
+async function loadFile(file: File, options: { skipUnsavedGuard?: boolean } = {}): Promise<boolean> {
   const msg = sbMessage();
   try {
+    if (!options.skipUnsavedGuard) {
+      const canReplace = await confirmSaveBeforeReplacingDocument(commandServices);
+      if (!canReplace) return false;
+    }
     msg.textContent = '파일 로딩 중...';
     const startTime = performance.now();
     const data = new Uint8Array(await file.arrayBuffer());
     await loadBytes(data, file.name, null, startTime);
+    return true;
   } catch (error) {
     showLoadError(error);
+    return false;
   }
 }
 
@@ -476,33 +555,31 @@ async function loadBytes(
   // initializeDocument 안에서 #177 validation 모달이 표시될 수 있음.
   // HWPX 토스트는 모달과의 이벤트 충돌을 피하기 위해 모달 닫힌 후 표시.
   await initializeDocument(docInfo, `${fileName} — ${docInfo.pageCount}페이지 (${elapsed.toFixed(1)}ms)`);
-  notifyHwpxBetaIfNeeded();
+  notifyHwpxSaveModeIfNeeded();
 }
 
 /**
- * #196: HWPX 출처 문서 로드 시 베타 안내 (저장 비활성화).
+ * #888: HWPX 출처 문서 로드 시 HWP 변환 저장 안내.
  * - 우상단 토스트 1회
  * - 상태 표시줄 메시지
- *
- * #197 (HWPX→HWP 완전 변환기) 완료 시 본 함수 제거.
  */
-function notifyHwpxBetaIfNeeded(): void {
+function notifyHwpxSaveModeIfNeeded(): void {
   if (wasm.getSourceFormat() !== 'hwpx') return;
 
   showToast({
-    message: 'HWPX 형식은 현재 베타 단계라 직접 저장이 비활성화되어 있습니다.\n다음 업데이트에서 지원 예정입니다.',
+    message: 'HWPX 문서는 저장 시 HWP 형식으로 변환 저장됩니다.\n원본 HWPX를 덮어쓰지 않도록 .hwp 파일명으로 저장합니다.',
     durationMs: 0, // 자동 페이드 없음 — 사용자가 확인 버튼으로 닫음
     action: {
-      label: '자세히',
+      label: '이슈 보기',
       onClick: () => {
-        window.open('https://github.com/edwardkim/rhwp/issues/197', '_blank');
+        window.open('https://github.com/edwardkim/rhwp/issues/888', '_blank');
       },
     },
     confirmLabel: '확인',
   });
 
   const sb = sbMessage();
-  if (sb) sb.textContent = 'HWPX 베타 모드 — 저장은 다음 업데이트에서 지원됩니다';
+  if (sb) sb.textContent = 'HWPX 변환 저장 모드 — 저장 시 HWP(.hwp)로 내보냅니다';
 }
 
 type DocumentByteKind = 'hwp' | 'hwpx' | 'html' | 'unknown';
@@ -561,19 +638,43 @@ async function createNewDocument(): Promise<void> {
   }
 }
 
+async function canReplaceCurrentDocument(skipUnsavedGuard?: boolean): Promise<boolean> {
+  return skipUnsavedGuard === true || await confirmSaveBeforeReplacingDocument(commandServices);
+}
+
 // 커맨드에서 새 문서 생성 호출
-eventBus.on('create-new-document', () => { createNewDocument(); });
+eventBus.on('create-new-document', (payload) => {
+  void (async () => {
+    const options = payload as { skipUnsavedGuard?: boolean } | undefined;
+    if (!await canReplaceCurrentDocument(options?.skipUnsavedGuard)) return;
+    await createNewDocument();
+  })();
+});
 eventBus.on('open-document-bytes', async (payload) => {
   const data = payload as {
     bytes: Uint8Array;
     fileName: string;
     fileHandle: typeof wasm.currentFileHandle;
+    skipUnsavedGuard?: boolean;
+    /** 문서 비교 등: 로드 완료를 기다리는 쪽과 짝을 맞출 때만 전달 */
+    requestId?: string;
+  };
+  const notifyDone = (ok: boolean, error?: string) => {
+    if (!data.requestId) return;
+    eventBus.emit('open-document-bytes:done', { requestId: data.requestId, ok, error });
   };
   try {
+    if (!await canReplaceCurrentDocument(data.skipUnsavedGuard)) {
+      notifyDone(false, '문서 열기가 취소되었습니다.');
+      return;
+    }
     await loadBytes(data.bytes, data.fileName, data.fileHandle);
+    notifyDone(true);
   } catch (error) {
     // #265: WASM 파서 에러 (예: HWP 3.0 미지원) 를 사용자에게 전파
     showLoadError(error);
+    const msg = error instanceof Error ? error.message : String(error);
+    notifyDone(false, msg);
   }
 });
 
@@ -610,8 +711,7 @@ async function loadFromUrlParam(): Promise<void> {
         if (result.error) throw new Error(result.error);
         const data = new Uint8Array(result.data);
         assertRemoteDocumentBytes(data);
-        const docInfo = wasm.loadDocument(data, fileName);
-        await initializeDocument(docInfo, `${fileName} — ${docInfo.pageCount}페이지`);
+        await loadBytes(data, fileName, null);
         return;
       }
     } else {
@@ -623,8 +723,7 @@ async function loadFromUrlParam(): Promise<void> {
     const buffer = await response.arrayBuffer();
     const data = new Uint8Array(buffer);
     assertRemoteDocumentBytes(data, contentType);
-    const docInfo = wasm.loadDocument(data, fileName);
-    await initializeDocument(docInfo, `${fileName} — ${docInfo.pageCount}페이지`);
+    await loadBytes(data, fileName, null);
   } catch (error) {
     showLoadError(error);
   }
@@ -650,7 +749,7 @@ function showLoadError(error: unknown): void {
   });
 }
 
-initialize();
+const initPromise = initialize();
 
 // ── iframe 연동 API (postMessage) ──
 // 부모 페이지에서 postMessage로 에디터를 제어할 수 있다.
@@ -663,10 +762,14 @@ window.addEventListener('message', async (e) => {
   // 기존 hwpctl-load 호환
   if (msg.type === 'hwpctl-load' && msg.data) {
     try {
+      await initPromise;
+      if (!await canReplaceCurrentDocument(Boolean(msg.skipUnsavedGuard))) {
+        e.source?.postMessage({ type: 'rhwp-response', id: msg.id, error: '문서 열기가 취소되었습니다.' }, { targetOrigin: '*' });
+        return;
+      }
       const bytes = new Uint8Array(msg.data);
-      const docInfo = wasm.loadDocument(bytes, msg.fileName || 'document.hwp');
-      await initializeDocument(docInfo, `${msg.fileName || 'document'} — ${docInfo.pageCount}페이지`);
-      e.source?.postMessage({ type: 'rhwp-response', id: msg.id, result: { pageCount: docInfo.pageCount } }, { targetOrigin: '*' });
+      await loadBytes(bytes, msg.fileName || 'document.hwp', null);
+      e.source?.postMessage({ type: 'rhwp-response', id: msg.id, result: { pageCount: wasm.pageCount } }, { targetOrigin: '*' });
     } catch (err: any) {
       e.source?.postMessage({ type: 'rhwp-response', id: msg.id, error: err.message || String(err) }, { targetOrigin: '*' });
     }
@@ -682,24 +785,41 @@ window.addEventListener('message', async (e) => {
 
   try {
     switch (method) {
+      case 'ready':
+        // wasm 초기화 완료 후에만 true 응답 — race condition 방지 (#522)
+        await initPromise;
+        reply(true);
+        break;
       case 'loadFile': {
+        await initPromise;
+        if (!await canReplaceCurrentDocument(Boolean(params?.skipUnsavedGuard))) {
+          reply(undefined, '문서 열기가 취소되었습니다.');
+          break;
+        }
         const bytes = new Uint8Array(params.data);
-        const docInfo = wasm.loadDocument(bytes, params.fileName || 'document.hwp');
-        await initializeDocument(docInfo, `${params.fileName || 'document'} — ${docInfo.pageCount}페이지`);
-        reply({ pageCount: docInfo.pageCount });
+        await loadBytes(bytes, params.fileName || 'document.hwp', null);
+        reply({ pageCount: wasm.pageCount });
         break;
       }
       case 'pageCount':
+        await initPromise;
         reply(wasm.pageCount);
         break;
       case 'getPageSvg':
+        await initPromise;
         reply(wasm.renderPageSvg(params.page ?? 0));
         break;
       case 'exportHwp':
+        await initPromise;
         reply(Array.from(wasm.exportHwp()));
         break;
-      case 'ready':
-        reply(true);
+      case 'exportHwpx':
+        await initPromise;
+        reply(Array.from(wasm.exportHwpx()));
+        break;
+      case 'exportHwpVerify':
+        await initPromise;
+        reply(JSON.parse(wasm.exportHwpVerify()));
         break;
       default:
         reply(undefined, `Unknown method: ${method}`);

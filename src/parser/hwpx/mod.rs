@@ -72,13 +72,28 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
     let header_xml = reader.read_file("Contents/header.xml")?;
     let (mut doc_info, doc_properties) = header::parse_hwpx_header(&header_xml)?;
 
+    // [Task #554] HWP3 → HWPX 변환본 식별: hwpml 스키마 버전 = "1.4"
+    // 변환본은 한글97의 "마지막 줄 tolerance" (1600 HU) 가 누락되어 페이지 수가
+    // 늘어나므로, 본 시점에 식별하여 page_def.margin_bottom 보정 (post-process)에 사용.
+    let hwpml_version = header::parse_hwpx_hwpml_version(&header_xml);
+    let is_hwp3_origin = hwpml_version.as_deref() == Some("1.4");
+
     // BinData 목록을 DocInfo에 등록
+    // [Task #873] isEmbeded="0" 인 외부 file 참조 (예: HWP3 → HWPX 변환본 의 절대 경로)
+    // 는 BinDataType::Link + abs_path 로 등록. 이후 populate_link_image_paths (parser/mod.rs)
+    // 가 Picture.external_path 설정 → Task #741 fallback 로 같은 dir 영역 image load.
     for (i, item) in package_info.bin_data_items.iter().enumerate() {
         let ext = item.href.rsplit('.').next().unwrap_or("dat").to_string();
+        let (data_type, abs_path) = if item.is_embedded {
+            (BinDataType::Embedding, None)
+        } else {
+            (BinDataType::Link, Some(item.href.clone()))
+        };
         doc_info.bin_data_list.push(BinData {
-            data_type: BinDataType::Embedding,
+            data_type,
             storage_id: (i + 1) as u16,
             extension: Some(ext),
+            abs_path,
             ..Default::default()
         });
     }
@@ -96,9 +111,23 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
         }
     }
 
+    // [Task #554] HWP3 변환본 보정: 한글97의 마지막 줄 tolerance 모방
+    // 모든 SectionDef.page_def 의 margin_bottom 을 1600 HU 줄여 한글97 페이지네이션과 정합.
+    if is_hwp3_origin {
+        for section in sections.iter_mut() {
+            section.section_def.page_def.margin_bottom =
+                section.section_def.page_def.margin_bottom.saturating_sub(1600);
+        }
+    }
+
     // 5. BinData 이미지 로딩
     let mut bin_data_content = Vec::new();
     for (i, item) in package_info.bin_data_items.iter().enumerate() {
+        // [Task #873] isEmbeded="0" (외부 file 참조) 는 ZIP 영역 영역 부재. skip.
+        // populate_link_image_paths + populate_external_images_from_dir 가 후처리.
+        if !item.is_embedded {
+            continue;
+        }
         match reader.read_file_bytes(&item.href) {
             Ok(data) => {
                 let ext = item.href.rsplit('.').next().unwrap_or("dat").to_string();
@@ -140,7 +169,7 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
         raw_data: None,
     };
 
-    let doc = Document {
+    let mut doc = Document {
         header: model_header,
         doc_properties,
         doc_info,
@@ -149,6 +178,11 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
         bin_data_content,
         extra_streams: Vec::new(),
     };
+
+    // [Task #873] BinData Link 타입 의 외부 file path 영역 영역 Picture.external_path 영역
+    // 전달. 이후 model::document::populate_external_images_from_dir (Task #741) 가 같은
+    // dir 영역 basename 매칭 영역 image 영역 자동 load. HWP5 parser 와 동일 처리.
+    super::populate_link_image_paths(&mut doc);
 
     Ok(doc)
 }

@@ -1,6 +1,7 @@
 //! 렌더링/페이지 정보/구성/페이지네이션/페이지 트리 관련 native 메서드
 
 use std::cell::RefCell;
+use std::fmt::Write as _;
 use crate::model::document::Section;
 use crate::model::control::Control;
 use crate::model::paragraph::Paragraph;
@@ -32,7 +33,7 @@ impl DocumentCore {
 
     /// 페이지 레이어 트리를 생성하여 반환한다 (native bridge / backend replay용).
     pub fn build_page_layer_tree(&self, page_num: u32) -> Result<PageLayerTree, HwpError> {
-        let tree = self.build_page_tree(page_num)?;
+        let tree = self.build_page_tree_cached(page_num)?;
         let _overflows = self.layout_engine.take_overflows();
         let output_options = LayerOutputOptions {
             show_paragraph_marks: self.show_paragraph_marks,
@@ -147,8 +148,426 @@ impl DocumentCore {
         Ok(renderer.command_count() as u32)
     }
 
+    pub fn get_canvaskit_replay_plan_native(
+        &self,
+        page_num: u32,
+        mode: &str,
+    ) -> Result<String, HwpError> {
+        use crate::renderer::canvaskit_policy::{
+            analyze_canvaskit_replay_plan, CanvasKitReplayMode,
+        };
+
+        let mode = CanvasKitReplayMode::from_str(mode).ok_or_else(|| {
+            HwpError::RenderError(format!(
+                "지원하지 않는 CanvasKit replay mode입니다: {mode}. allowed modes: default, compat"
+            ))
+        })?;
+        let tree = self.build_page_layer_tree(page_num)?;
+        let plan = analyze_canvaskit_replay_plan(&tree, mode);
+        serde_json::to_string(&plan).map_err(|error| {
+            HwpError::RenderError(format!(
+                "CanvasKit replay plan JSON 직렬화에 실패했습니다: {error}"
+            ))
+        })
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+    pub fn render_page_png_native(&self, page_num: u32) -> Result<Vec<u8>, HwpError> {
+        use crate::renderer::layer_renderer::LayerRasterRenderer;
+        use crate::renderer::skia::SkiaLayerRenderer;
+
+        let layer_tree = self.build_page_layer_tree(page_num)?;
+        SkiaLayerRenderer::new().render_png(&layer_tree)
+    }
+
+    /// 사용자 지정 폰트 경로를 포함한 PNG 렌더링. SVG 의 `--font-path` 와 동일 패턴.
+    /// ttfs 디렉토리의 한컴 전용 폰트 (HY견명조 등) 가 시스템 fontconfig 에 없을 때 사용.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+    pub fn render_page_png_native_with_fonts(
+        &self,
+        page_num: u32,
+        font_paths: &[std::path::PathBuf],
+    ) -> Result<Vec<u8>, HwpError> {
+        use crate::renderer::layer_renderer::LayerRasterRenderer;
+        use crate::renderer::skia::SkiaLayerRenderer;
+
+        let layer_tree = self.build_page_layer_tree(page_num)?;
+        SkiaLayerRenderer::new()
+            .with_font_paths(font_paths)
+            .render_png(&layer_tree)
+    }
+
+    /// 옵션 (scale / max-dimension / VLM 프리셋 / font_paths) 적용 PNG 렌더링.
+    /// AI 파이프라인 + VLM (Vision-Language Model) 연동 사용 사례용.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+    pub fn render_page_png_native_with_export_options(
+        &self,
+        page_num: u32,
+        options: &PngExportOptions,
+    ) -> Result<Vec<u8>, HwpError> {
+        use crate::renderer::layer_renderer::{LayerRasterRenderer, RasterRenderOptions};
+        use crate::renderer::skia::SkiaLayerRenderer;
+
+        let layer_tree = self.build_page_layer_tree(page_num)?;
+
+        // 페이지 크기에서 effective scale + max_dimension 결정
+        let mut raster_options = RasterRenderOptions::default();
+
+        // VLM 프리셋 적용 (longest edge 한도 + 픽셀 수 한도)
+        let mut effective_max_dim: Option<i32> = options.max_dimension;
+        let mut effective_max_pixels: Option<u64> = None;
+        if let Some(target) = options.vlm_target {
+            let (longest_edge, max_pixels) = target.constraints();
+            // 명시 max_dimension 이 없으면 프리셋 한도 사용
+            effective_max_dim.get_or_insert(longest_edge);
+            effective_max_pixels = Some(max_pixels);
+        }
+
+        // scale 결정 우선순위:
+        // 1. 명시 scale (사용자 직접 지정)
+        // 2. max_dimension / VLM 기반 자동 계산
+        // 3. --dpi 만 지정 시 scale = dpi / 96.0 (#614)
+        // 4. 기본 1.0
+        let scale = if let Some(s) = options.scale {
+            s
+        } else if effective_max_dim.is_some() || effective_max_pixels.is_some() {
+            let mut auto_scale: f64 = 1.0;
+            // longest edge 한도
+            if let Some(max_dim) = effective_max_dim {
+                let longest_page_edge = layer_tree.page_width.max(layer_tree.page_height);
+                if longest_page_edge > 0.0 {
+                    auto_scale = auto_scale.min(max_dim as f64 / longest_page_edge);
+                }
+            }
+            // 픽셀 수 한도 (ceil + 부동소수점 오차 안전 마진 0.5%)
+            if let Some(max_pixels) = effective_max_pixels {
+                let page_pixels = layer_tree.page_width * layer_tree.page_height;
+                if page_pixels > 0.0 {
+                    let pixel_scale = (max_pixels as f64 / page_pixels).sqrt() * 0.995;
+                    auto_scale = auto_scale.min(pixel_scale);
+                }
+            }
+            // 1.0 초과 시는 페이지가 이미 충분히 작은 것이므로 1.0 으로 cap
+            auto_scale.min(1.0).max(0.1)
+        } else if let Some(dpi) = options.dpi {
+            (dpi / 96.0).max(0.1)
+        } else {
+            1.0
+        };
+
+        raster_options.scale = scale;
+        raster_options.dpi = options.dpi;
+        if let Some(max_dim) = effective_max_dim {
+            raster_options.max_dimension = max_dim;
+        }
+        if let Some(max_pixels) = effective_max_pixels {
+            raster_options.max_pixels = max_pixels;
+        }
+
+        let png_bytes = SkiaLayerRenderer::new()
+            .with_font_paths(&options.font_paths)
+            .render_png_with_options(&layer_tree, raster_options)?;
+
+        if let Some(dpi) = options.dpi {
+            Ok(inject_png_phys(png_bytes, dpi))
+        } else {
+            Ok(png_bytes)
+        }
+    }
+}
+
+/// PNG 바이트에 pHYs chunk 를 삽입한다 (IHDR 직후, 첫 IDAT 직전).
+/// pHYs chunk: 4-byte X ppm + 4-byte Y ppm + 1-byte unit(1=meter).
+#[cfg(not(target_arch = "wasm32"))]
+fn inject_png_phys(png: Vec<u8>, dpi: f64) -> Vec<u8> {
+    const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    const IHDR_DATA_LEN: usize = 13;
+
+    let ppm = (dpi / 0.0254).round() as u32;
+    if png.len() < 8 || png[..8] != PNG_SIGNATURE {
+        return png;
+    }
+    let pos = 8; // signature 이후
+    if pos + 8 > png.len() {
+        return png;
+    }
+    let ihdr_len = u32::from_be_bytes([png[pos], png[pos + 1], png[pos + 2], png[pos + 3]]) as usize;
+    if ihdr_len != IHDR_DATA_LEN || &png[pos + 4..pos + 8] != b"IHDR" {
+        return png;
+    }
+    let Some(ihdr_end) = pos.checked_add(4 + 4 + ihdr_len + 4) else { return png };
+    if ihdr_end > png.len() {
+        return png;
+    }
+
+    // pHYs chunk 구성 (9 bytes data)
+    let mut phys_data = Vec::with_capacity(9);
+    phys_data.extend_from_slice(&ppm.to_be_bytes()); // X pixels per unit
+    phys_data.extend_from_slice(&ppm.to_be_bytes()); // Y pixels per unit
+    phys_data.push(1); // unit = meter
+
+    let phys_type = b"pHYs";
+    let mut phys_chunk = Vec::with_capacity(4 + 4 + 9 + 4);
+    phys_chunk.extend_from_slice(&(9u32).to_be_bytes()); // length
+    phys_chunk.extend_from_slice(phys_type);
+    phys_chunk.extend_from_slice(&phys_data);
+    // CRC: type + data
+    let mut crc_input = Vec::with_capacity(4 + 9);
+    crc_input.extend_from_slice(phys_type);
+    crc_input.extend_from_slice(&phys_data);
+    let crc = png_crc32(&crc_input);
+    phys_chunk.extend_from_slice(&crc.to_be_bytes());
+
+    let mut result = Vec::with_capacity(png.len() + phys_chunk.len());
+    result.extend_from_slice(&png[..ihdr_end]);
+    result.extend_from_slice(&phys_chunk);
+    result.extend_from_slice(&png[ihdr_end..]);
+    result
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn png_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// PNG 내보내기 옵션 (export-png CLI / API 통합).
+///
+/// AI 파이프라인 + VLM (Vision-Language Model) 연동 사용 사례용.
+/// `vlm_target` 프리셋 → `max_dimension` → `scale` 순으로 우선순위.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+#[derive(Debug, Clone, Default)]
+pub struct PngExportOptions {
+    /// 명시 배율 (scale). None 이면 max_dimension 기반 자동 계산.
+    pub scale: Option<f64>,
+    /// 한 변 최대 픽셀 (longest edge). VLM 입력 한도용.
+    pub max_dimension: Option<i32>,
+    /// VLM 프리셋. Claude / 향후 GPT-4V / Gemini / Qwen-VL / LLaVA 확장 (이슈 #613).
+    pub vlm_target: Option<VlmTarget>,
+    /// DPI 메타데이터. PNG pHYs chunk 에 기록. 실제 래스터 픽셀 수에 영향 없음.
+    /// `scale` 미지정 시 `scale = dpi / 96.0` 자동 계산.
+    pub dpi: Option<f64>,
+    /// 사용자 지정 폰트 디렉토리 (ttfs 등). SVG 의 `--font-path` 와 동일.
+    pub font_paths: Vec<std::path::PathBuf>,
+}
+
+/// VLM (Vision-Language Model) 입력 사양 프리셋.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VlmTarget {
+    /// Claude Vision (Anthropic): longest edge ≤1568 px, ≤1.15 MP.
+    Claude,
+    /// GPT-4V low detail (OpenAI): 512×512 고정.
+    Gpt4vLow,
+    /// GPT-4V high detail (OpenAI): 768×2000 tile 기반.
+    Gpt4vHigh,
+    /// Gemini (Google): longest edge ≤3072 px.
+    Gemini,
+    /// Qwen-VL (Alibaba): longest edge ≤2240 px, 28×28 patch 기반.
+    QwenVl,
+    /// LLaVA / 기타 OSS (CLIP backbone): longest edge ≤672 px.
+    Llava,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+impl VlmTarget {
+    /// (longest_edge, max_pixels) 한도 반환.
+    pub fn constraints(&self) -> (i32, u64) {
+        match self {
+            VlmTarget::Claude => (1568, 1_150_000),
+            VlmTarget::Gpt4vLow => (512, 262_144),
+            VlmTarget::Gpt4vHigh => (2000, 1_536_000),
+            VlmTarget::Gemini => (3072, 9_437_184),
+            VlmTarget::QwenVl => (2240, 5_017_600),
+            VlmTarget::Llava => (672, 451_584),
+        }
+    }
+
+    /// CLI 옵션 문자열 → VlmTarget 변환.
+    /// 하이픈/밑줄 정규화 후 매칭. `gpt4v`/`qwen` 등 축약 별칭도 허용.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().replace('-', "_").as_str() {
+            "claude" => Some(VlmTarget::Claude),
+            "gpt4v_low" => Some(VlmTarget::Gpt4vLow),
+            "gpt4v_high" | "gpt4v" => Some(VlmTarget::Gpt4vHigh),
+            "gemini" => Some(VlmTarget::Gemini),
+            "qwen_vl" | "qwen" => Some(VlmTarget::QwenVl),
+            "llava" => Some(VlmTarget::Llava),
+            _ => None,
+        }
+    }
+
+    pub fn all_names() -> &'static str {
+        "claude, gpt4v-low, gpt4v-high (또는 gpt4v), gemini, qwen-vl (또는 qwen), llava"
+    }
+}
+
+impl DocumentCore {
     pub fn get_page_layer_tree_native(&self, page_num: u32) -> Result<String, HwpError> {
         Ok(self.build_page_layer_tree(page_num)?.to_json())
+    }
+
+    /// 페이지 overlay 이미지 정보만 작은 JSON으로 반환한다.
+    ///
+    /// Studio는 BehindText/InFrontOfText 그림 overlay 계산을 위해 전체 PageLayerTree JSON을
+    /// 파싱할 필요가 없다. 특히 그림이 본문 layer에만 있는 페이지에서는 빈 overlay 배열과
+    /// imageCount만 반환하여 입력 중 대용량 JSON 직렬화/파싱을 피한다.
+    pub fn get_page_overlay_images_native(&self, page_num: u32) -> Result<String, HwpError> {
+        use base64::Engine;
+        use crate::model::image::ImageEffect;
+        use crate::model::shape::TextWrap;
+        use crate::paint::{LayerNode, LayerNodeKind, PaintOp};
+        use crate::renderer::render_tree::{BoundingBox, ImageNode};
+
+        fn effect_str(value: ImageEffect) -> &'static str {
+            match value {
+                ImageEffect::RealPic => "realPic",
+                ImageEffect::GrayScale => "grayScale",
+                ImageEffect::BlackWhite => "blackWhite",
+                ImageEffect::Pattern8x8 => "pattern8x8",
+            }
+        }
+
+        fn wrap_str(value: TextWrap) -> &'static str {
+            match value {
+                TextWrap::BehindText => "behindText",
+                TextWrap::InFrontOfText => "inFrontOfText",
+                _ => "flow",
+            }
+        }
+
+        fn write_json_str(buf: &mut String, value: &str) {
+            buf.push('"');
+            buf.push_str(&crate::document_core::helpers::json_escape(value));
+            buf.push('"');
+        }
+
+        fn write_bbox(buf: &mut String, bbox: BoundingBox) {
+            let _ = write!(
+                buf,
+                "{{\"x\":{:.3},\"y\":{:.3},\"width\":{:.3},\"height\":{:.3}}}",
+                bbox.x, bbox.y, bbox.width, bbox.height
+            );
+        }
+
+        fn write_overlay_image(
+            buf: &mut String,
+            bbox: BoundingBox,
+            image: &ImageNode,
+            wrap: TextWrap,
+        ) {
+            if !buf.is_empty() {
+                buf.push(',');
+            }
+
+            let mut mime = "application/octet-stream";
+            let mut base64_data = String::new();
+            if let Some(data) = &image.data {
+                let detected = crate::renderer::svg::detect_image_mime_type(data);
+                let (final_mime, final_data): (&str, std::borrow::Cow<[u8]>) =
+                    if detected == "image/x-pcx" {
+                        match crate::renderer::svg::pcx_bytes_to_png_bytes(data) {
+                            Some(png) => ("image/png", std::borrow::Cow::Owned(png)),
+                            None => (detected, std::borrow::Cow::Borrowed(data.as_slice())),
+                        }
+                    } else if detected == "image/bmp" {
+                        match crate::renderer::svg::bmp_bytes_to_png_bytes(data) {
+                            Some(png) => ("image/png", std::borrow::Cow::Owned(png)),
+                            None => (detected, std::borrow::Cow::Borrowed(data.as_slice())),
+                        }
+                    } else {
+                        (detected, std::borrow::Cow::Borrowed(data.as_slice()))
+                    };
+                mime = final_mime;
+                base64_data = base64::engine::general_purpose::STANDARD.encode(&*final_data);
+            }
+
+            buf.push('{');
+            buf.push_str("\"bbox\":");
+            write_bbox(buf, bbox);
+            buf.push_str(",\"mime\":");
+            write_json_str(buf, mime);
+            buf.push_str(",\"base64\":");
+            write_json_str(buf, &base64_data);
+            buf.push_str(",\"effect\":");
+            write_json_str(buf, effect_str(image.effect));
+            let _ = write!(
+                buf,
+                ",\"brightness\":{},\"contrast\":{},\"wrap\":",
+                image.brightness, image.contrast
+            );
+            write_json_str(buf, wrap_str(wrap));
+
+            let attr = crate::model::image::ImageAttr {
+                brightness: image.brightness,
+                contrast: image.contrast,
+                effect: image.effect,
+                bin_data_id: image.bin_data_id,
+                external_path: None,
+            };
+            if let Some(preset) = attr.watermark_preset() {
+                let _ = write!(buf, ",\"watermark\":{{\"preset\":\"{}\"}}", preset);
+            }
+
+            let _ = write!(
+                buf,
+                ",\"transform\":{{\"rotation\":{:.3},\"horzFlip\":{},\"vertFlip\":{}}}}}",
+                image.transform.rotation, image.transform.horz_flip, image.transform.vert_flip
+            );
+        }
+
+        fn collect(
+            node: &LayerNode,
+            behind: &mut String,
+            front: &mut String,
+            image_count: &mut usize,
+        ) {
+            match &node.kind {
+                LayerNodeKind::Group { children, .. } => {
+                    for child in children {
+                        collect(child, behind, front, image_count);
+                    }
+                }
+                LayerNodeKind::ClipRect { child, .. } => collect(child, behind, front, image_count),
+                LayerNodeKind::Leaf { ops } => {
+                    for op in ops {
+                        if let PaintOp::Image { bbox, image } = op {
+                            *image_count += 1;
+                            match image.text_wrap {
+                                Some(TextWrap::BehindText) => {
+                                    write_overlay_image(behind, *bbox, image, TextWrap::BehindText);
+                                }
+                                Some(TextWrap::InFrontOfText) => {
+                                    write_overlay_image(front, *bbox, image, TextWrap::InFrontOfText);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let tree = self.build_page_layer_tree(page_num)?;
+        let mut behind = String::new();
+        let mut front = String::new();
+        let mut image_count = 0usize;
+        collect(&tree.root, &mut behind, &mut front, &mut image_count);
+
+        Ok(format!(
+            "{{\"behind\":[{}],\"front\":[{}],\"imageCount\":{}}}",
+            behind, front, image_count
+        ))
     }
 
     /// 페이지 정보 (네이티브 에러 타입)
@@ -536,11 +955,37 @@ impl DocumentCore {
                         }
                         _ => String::new(),
                     };
+                    // Task #516 결함 3: hit-test 정합 (옵션 3-C) — wrap 모드 노출.
+                    // BehindText 그림은 텍스트 영역 위에서는 hit-test 후순위 처리.
+                    let wrap_str = match image_node.text_wrap {
+                        Some(crate::model::shape::TextWrap::BehindText) => ",\"wrap\":\"behindText\"",
+                        Some(crate::model::shape::TextWrap::InFrontOfText) => ",\"wrap\":\"inFrontOfText\"",
+                        Some(crate::model::shape::TextWrap::Square) => ",\"wrap\":\"square\"",
+                        Some(crate::model::shape::TextWrap::Tight) => ",\"wrap\":\"tight\"",
+                        Some(crate::model::shape::TextWrap::Through) => ",\"wrap\":\"through\"",
+                        Some(crate::model::shape::TextWrap::TopAndBottom) => ",\"wrap\":\"topAndBottom\"",
+                        None => "",
+                    };
+                    // [Task #825] 머리말/꼬리말 그림 marker — rhwp-studio findPictureAtClick
+                    // 이 secIdx 부재로 필터링하지 않도록 hf 정보 포함.
+                    let hf_str = match &image_node.header_footer_ref {
+                        Some(r) => {
+                            let kind = match r.kind {
+                                crate::renderer::render_tree::HeaderFooterKind::Header => "header",
+                                crate::renderer::render_tree::HeaderFooterKind::Footer => "footer",
+                            };
+                            format!(
+                                ",\"headerFooter\":{{\"kind\":\"{}\",\"outerParaIdx\":{},\"outerControlIdx\":{}}}",
+                                kind, r.outer_para_index, r.outer_control_index
+                            )
+                        }
+                        None => String::new(),
+                    };
 
                     controls.push(format!(
-                        "{{\"type\":\"image\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1}{}}}",
+                        "{{\"type\":\"image\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1}{}{}{}}}",
                         node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
-                        doc_coords
+                        doc_coords, wrap_str, hf_str
                     ));
                     return;
                 }
@@ -805,7 +1250,7 @@ impl DocumentCore {
         // 벡터 크기 동기화
         let sec_count = self.document.sections.len();
         while self.pagination.len() < sec_count {
-            self.pagination.push(PaginationResult { pages: Vec::new(), wrap_around_paras: Vec::new(), hidden_empty_paras: std::collections::HashSet::new() });
+            self.pagination.push(PaginationResult { pages: Vec::new(), wrap_around_paras: Vec::new(), hidden_empty_paras: std::collections::HashSet::new(), endnotes: Vec::new(), endnote_paragraphs: Vec::new() });
         }
         self.pagination.truncate(sec_count);
         while self.para_column_map.len() < sec_count {
@@ -1621,12 +2066,30 @@ impl DocumentCore {
             self.layout_engine.set_hidden_empty_paras(&pr.hidden_empty_paras);
         }
 
+        // [Task #836] 미주 paragraphs를 본문 paragraphs 뒤에 합쳐서 전달
+        // endnote para_index = paragraphs.len() + idx → combined에서 접근 가능
+        let en_paras = self.pagination.get(sec_idx)
+            .map(|pr| pr.endnote_paragraphs.as_slice())
+            .unwrap_or(&[]);
+        let combined_paragraphs: Vec<Paragraph>;
+        let combined_composed: Vec<crate::renderer::composer::ComposedParagraph>;
+        let (render_paragraphs, render_composed): (&[Paragraph], &[crate::renderer::composer::ComposedParagraph]) = if en_paras.is_empty() {
+            (paragraphs, composed)
+        } else {
+            combined_paragraphs = paragraphs.iter().chain(en_paras.iter()).cloned().collect();
+            let en_composed: Vec<_> = en_paras.iter()
+                .map(|p| crate::renderer::composer::compose_paragraph(p))
+                .collect();
+            combined_composed = composed.iter().cloned().chain(en_composed.into_iter()).collect();
+            (&combined_paragraphs, &combined_composed)
+        };
+
         let mut tree = self.layout_engine.build_render_tree(
             page_content,
-            paragraphs,
+            render_paragraphs,
             header_paragraphs,
             footer_paragraphs,
-            composed,
+            render_composed,
             &self.styles,
             footnote_shape,
             &self.document.bin_data_content,
@@ -2120,6 +2583,46 @@ mod tests {
         }
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+    #[test]
+    fn render_page_png_native_uses_document_core_skia_layer_path() {
+        use crate::model::document::{Document, Section, SectionDef};
+        use crate::model::page::PageDef;
+        use crate::model::paragraph::Paragraph;
+
+        let mut document = Document::default();
+        document.sections.push(Section {
+            section_def: SectionDef {
+                page_def: PageDef {
+                    width: 59528,
+                    height: 84188,
+                    margin_left: 8504,
+                    margin_right: 8504,
+                    margin_top: 5668,
+                    margin_bottom: 4252,
+                    margin_header: 4252,
+                    margin_footer: 4252,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            paragraphs: vec![Paragraph::default()],
+            raw_stream: None,
+        });
+
+        let mut core = DocumentCore::new_empty();
+        core.set_document(document);
+
+        let png = core
+            .render_page_png_native(0)
+            .expect("empty document should render through native Skia");
+
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let decoded = image::load_from_memory(&png).expect("decode native Skia PNG");
+        assert!(decoded.width() > 0);
+        assert!(decoded.height() > 0);
+    }
+
     #[test]
     fn get_bin_data_returns_zero_based_content_slice() {
         let mut core = DocumentCore::new_empty();
@@ -2137,5 +2640,101 @@ mod tests {
         assert_eq!(core.get_bin_data(0), Some(&[0x01, 0x02, 0x03][..]));
         assert_eq!(core.get_bin_data(1), Some(&[0xAA, 0xBB][..]));
         assert_eq!(core.get_bin_data(2), None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn inject_png_phys_inserts_after_ihdr() {
+        // 최소 PNG: 8-byte signature + IHDR chunk (13 bytes data)
+        let mut png = Vec::new();
+        png.extend_from_slice(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]); // signature
+        // IHDR: length=13
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0u8; 13]); // dummy IHDR data
+        let ihdr_crc = super::png_crc32(&{
+            let mut v = Vec::new();
+            v.extend_from_slice(b"IHDR");
+            v.extend_from_slice(&[0u8; 13]);
+            v
+        });
+        png.extend_from_slice(&ihdr_crc.to_be_bytes());
+        let ihdr_end = png.len(); // 8 + 4 + 4 + 13 + 4 = 33
+        // IDAT dummy
+        png.extend_from_slice(&4u32.to_be_bytes());
+        png.extend_from_slice(b"IDAT");
+        png.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let idat_crc = super::png_crc32(&{
+            let mut v = Vec::new();
+            v.extend_from_slice(b"IDAT");
+            v.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+            v
+        });
+        png.extend_from_slice(&idat_crc.to_be_bytes());
+
+        let result = super::inject_png_phys(png.clone(), 300.0);
+
+        // pHYs chunk 삽입 확인: IHDR 직후에 pHYs 가 위치
+        assert_eq!(&result[ihdr_end + 4..ihdr_end + 8], b"pHYs");
+        // pHYs data length = 9
+        let phys_len = u32::from_be_bytes([
+            result[ihdr_end], result[ihdr_end + 1],
+            result[ihdr_end + 2], result[ihdr_end + 3],
+        ]);
+        assert_eq!(phys_len, 9);
+        // 300 DPI → 11811 ppm (300 / 0.0254 = 11811.02...)
+        let ppm = u32::from_be_bytes([
+            result[ihdr_end + 8], result[ihdr_end + 9],
+            result[ihdr_end + 10], result[ihdr_end + 11],
+        ]);
+        assert_eq!(ppm, 11811);
+        // unit = 1 (meter)
+        assert_eq!(result[ihdr_end + 16], 1);
+        // IDAT 는 pHYs 뒤에 보존
+        let phys_chunk_size = 4 + 4 + 9 + 4; // 21
+        let idat_pos = ihdr_end + phys_chunk_size;
+        assert_eq!(&result[idat_pos + 4..idat_pos + 8], b"IDAT");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn png_crc32_known_value() {
+        let crc = super::png_crc32(b"IHDR");
+        assert_eq!(crc, 0xA8A1_AE0A);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+    #[test]
+    fn vlm_target_from_str_all_variants() {
+        use super::VlmTarget;
+        assert_eq!(VlmTarget::from_str("claude"), Some(VlmTarget::Claude));
+        assert_eq!(VlmTarget::from_str("gpt4v-low"), Some(VlmTarget::Gpt4vLow));
+        assert_eq!(VlmTarget::from_str("gpt4v_low"), Some(VlmTarget::Gpt4vLow));
+        assert_eq!(VlmTarget::from_str("gpt4v-high"), Some(VlmTarget::Gpt4vHigh));
+        assert_eq!(VlmTarget::from_str("gpt4v"), Some(VlmTarget::Gpt4vHigh));
+        assert_eq!(VlmTarget::from_str("gemini"), Some(VlmTarget::Gemini));
+        assert_eq!(VlmTarget::from_str("qwen-vl"), Some(VlmTarget::QwenVl));
+        assert_eq!(VlmTarget::from_str("qwen_vl"), Some(VlmTarget::QwenVl));
+        assert_eq!(VlmTarget::from_str("qwen"), Some(VlmTarget::QwenVl));
+        assert_eq!(VlmTarget::from_str("llava"), Some(VlmTarget::Llava));
+        assert_eq!(VlmTarget::from_str("CLAUDE"), Some(VlmTarget::Claude));
+        assert_eq!(VlmTarget::from_str("unknown"), None);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+    #[test]
+    fn vlm_target_constraints_are_sane() {
+        use super::VlmTarget;
+        let targets = [
+            VlmTarget::Claude, VlmTarget::Gpt4vLow, VlmTarget::Gpt4vHigh,
+            VlmTarget::Gemini, VlmTarget::QwenVl, VlmTarget::Llava,
+        ];
+        for t in &targets {
+            let (edge, pixels) = t.constraints();
+            assert!(edge > 0, "{:?} edge should be positive", t);
+            assert!(pixels > 0, "{:?} pixels should be positive", t);
+            assert!((edge as u64) * (edge as u64) >= pixels,
+                "{:?} max_pixels should be reachable within edge", t);
+        }
     }
 }

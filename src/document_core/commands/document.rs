@@ -35,6 +35,18 @@ pub struct HwpExportVerification {
 }
 
 impl DocumentCore {
+    /// [Task #741 후속] 외부 file path 그림 영역 의 binary 영역 영역 base_dir 영역 영역 자동 load.
+    ///
+    /// HWP3 파일 영역 image 영역 영역 영역 영역 절대 경로 (예: "D:\\Work\\...\\rdb02.gif") 영역
+    /// 저장 영역. 본 환경 영역 영역 영역 path 영역 영역 access 부재 영역 영역 영역, basename
+    /// 영역 영역 추출 → `base_dir` 영역 영역 영역 file 영역 load → renderer 영역 영역 표시.
+    ///
+    /// 반환: load 영역 image 영역.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn populate_external_images_from_dir(&mut self, base_dir: &std::path::Path) -> usize {
+        self.document.populate_external_images_from_dir(base_dir)
+    }
+
     pub fn from_bytes(data: &[u8]) -> Result<DocumentCore, HwpError> {
         let source_format = crate::parser::detect_format(data);
         let mut document = crate::parser::parse_document(data)
@@ -45,7 +57,9 @@ impl DocumentCore {
         // 비표준 lineseg 감지 — reflow 이전 시점에 IR을 그대로 검증.
         // 경고는 사용자에게 고지되며, 자동 reflow 는 `needs_line_seg_reflow` 조건에만 한정.
         // 사용자 명시 reflow 는 `reflow_linesegs_on_demand()` 를 통해서만 수행 (#177).
-        let validation_report = Self::validate_linesegs(&document);
+        // LinesegTextRunReflow는 HWPX 전용 비표준 패턴. HWP3/HWP5는 1 line_info = 1 lineseg가 정상.
+        let check_textrun_reflow = matches!(source_format, crate::parser::FileFormat::Hwpx);
+        let validation_report = Self::validate_linesegs(&document, check_textrun_reflow);
 
         // lineSegArray가 없는 문단(line_height=0)에 대해 합성 LineSeg 생성
         // HWPX에서 lineSegArray 누락 시 기본값(모든 필드 0)이 들어가므로,
@@ -120,13 +134,15 @@ impl DocumentCore {
     /// 감지 규칙:
     /// - 텍스트가 있는데 `line_segs` 가 비어있음 → `LinesegArrayEmpty`
     /// - `line_segs.len() == 1 && line_height == 0` → `LinesegUncomputed`
+    /// - `check_textrun_reflow=true` 일 때만: 긴 텍스트 + lineseg 1개 → `LinesegTextRunReflow`
+    ///   (HWPX 전용 패턴. HWP3/HWP5는 1 line_info → 1 lineseg가 정상이므로 건너뜀.)
     ///
     /// 표 셀 내부 문단도 재귀 검사한다.
-    pub(crate) fn validate_linesegs(document: &Document) -> ValidationReport {
+    pub(crate) fn validate_linesegs(document: &Document, check_textrun_reflow: bool) -> ValidationReport {
         let mut report = ValidationReport::new();
         for (si, section) in document.sections.iter().enumerate() {
             for (pi, para) in section.paragraphs.iter().enumerate() {
-                Self::check_paragraph_linesegs(para, si, pi, None, &mut report);
+                Self::check_paragraph_linesegs(para, si, pi, None, check_textrun_reflow, &mut report);
 
                 // 표 셀 내부 문단도 재귀 검사
                 for (ci, ctrl) in para.controls.iter().enumerate() {
@@ -144,6 +160,7 @@ impl DocumentCore {
                                     si,
                                     pi,
                                     Some(cell_path),
+                                    check_textrun_reflow,
                                     &mut report,
                                 );
                             }
@@ -160,6 +177,7 @@ impl DocumentCore {
         section_idx: usize,
         paragraph_idx: usize,
         cell_path: Option<CellPath>,
+        check_textrun_reflow: bool,
         report: &mut ValidationReport,
     ) {
         // 규칙 1: 텍스트가 있는데 lineseg 배열이 비어있음
@@ -183,12 +201,13 @@ impl DocumentCore {
             return;
         }
         // 규칙 3: lineseg 1개인데 텍스트가 길고 '\n' 이 없음 — 한컴이 textRun reflow 에
-        // 의존하는 패턴 (Discussion #188). rhwp 는 1개 lineseg 로 모든 텍스트를 한 줄에
-        // 그려 겹침이 발생. 보정 대상.
+        // 의존하는 패턴 (Discussion #188). HWPX 전용. HWP3/HWP5는 1 line_info → 1 lineseg가
+        // 정상이므로 check_textrun_reflow=false 로 호출하면 건너뜀.
         //
         // 휴리스틱 threshold = 40자 (한글 한 줄 ~30자 안팎을 기준으로 보수적).
         const LONG_TEXT_THRESHOLD: usize = 40;
-        if para.line_segs.len() == 1
+        if check_textrun_reflow
+            && para.line_segs.len() == 1
             && !para.text.contains('\n')
             && para.text.chars().count() > LONG_TEXT_THRESHOLD
         {
@@ -258,12 +277,18 @@ impl DocumentCore {
                 for ctrl in &mut para.controls {
                     if let Control::Table(ref mut table) = ctrl {
                         for cell in &mut table.cells {
+                            // [Task #671 후속 / Issue #671 자동보정 영역 정정]
+                            // 셀 폭 (cell.width) 에서 좌우 padding 차감하여 셀 inner 폭 계산.
+                            // col_width 사용 시 셀 너비 영역 밖으로 LINE_SEG 가 채워져
+                            // recompose_for_cell_width 가드 #1 (line_segs.is_empty()) 영역 거짓 →
+                            // PR #673 영역의 layout 단계 정정 미적용 → 자동보정 모드 영역 한 줄 겹침 회귀.
+                            let cell_w_px = crate::renderer::hwpunit_to_px(cell.width as i32, dpi);
+                            let pad_left = crate::renderer::hwpunit_to_px(cell.padding.left as i32, dpi);
+                            let pad_right = crate::renderer::hwpunit_to_px(cell.padding.right as i32, dpi);
+                            let cell_inner_width = (cell_w_px - pad_left - pad_right).max(1.0);
                             for cell_para in &mut cell.paragraphs {
                                 if Self::needs_line_seg_reflow(cell_para) {
-                                    // 셀 너비가 아직 불확정이므로 컬럼 너비를 근사값으로 사용.
-                                    // 핵심은 line_height > 0을 보장하는 것이며,
-                                    // 실제 셀 내 줄바꿈은 테이블 레이아웃이 재수행한다.
-                                    reflow_line_segs(cell_para, col_width, styles, dpi);
+                                    reflow_line_segs(cell_para, cell_inner_width, styles, dpi);
                                 }
                             }
                         }
@@ -403,7 +428,8 @@ impl DocumentCore {
                 .map(|a| a.width)
                 .unwrap_or(layout.body_area.width);
 
-            for para in &mut section.paragraphs {
+            let mut min_reflowed_idx: Option<usize> = None;
+            for (pi, para) in section.paragraphs.iter_mut().enumerate() {
                 if Self::needs_reflow_broadly(para) {
                     let para_style = styles.para_styles.get(para.para_shape_id as usize);
                     let margin_left = para_style.map(|s| s.margin_left).unwrap_or(0.0);
@@ -411,20 +437,41 @@ impl DocumentCore {
                     let available_width = (col_width - margin_left - margin_right).max(1.0);
                     reflow_line_segs(para, available_width, &styles, dpi);
                     reflowed += 1;
+                    if min_reflowed_idx.is_none() {
+                        min_reflowed_idx = Some(pi);
+                    }
                 }
                 // 표 셀 내부 문단도 동일 처리
                 for ctrl in &mut para.controls {
                     if let Control::Table(ref mut table) = ctrl {
                         for cell in &mut table.cells {
+                            // [Task #671 후속 / Issue #671 자동보정 영역 정정]
+                            // 셀 폭 (cell.width) 에서 좌우 padding 차감하여 셀 inner 폭 계산.
+                            // 동일 본질 정정: line 270 영역 참조.
+                            let cell_w_px = crate::renderer::hwpunit_to_px(cell.width as i32, dpi);
+                            let pad_left = crate::renderer::hwpunit_to_px(cell.padding.left as i32, dpi);
+                            let pad_right = crate::renderer::hwpunit_to_px(cell.padding.right as i32, dpi);
+                            let cell_inner_width = (cell_w_px - pad_left - pad_right).max(1.0);
                             for cell_para in &mut cell.paragraphs {
                                 if Self::needs_reflow_broadly(cell_para) {
-                                    reflow_line_segs(cell_para, col_width, &styles, dpi);
+                                    reflow_line_segs(cell_para, cell_inner_width, &styles, dpi);
                                     reflowed += 1;
                                 }
                             }
                         }
                     }
                 }
+            }
+
+            // [Task #927] reflow 후 vpos 일관성 재계산 — 본문 paragraphs 만.
+            // 빈 lineseg 였던 문단들은 reflow 시 vpos_start=0 으로 시작하여 후속 문단
+            // 의 vpos 연속성이 깨짐. paginator 의 vpos_h 기반 current_height 조정이
+            // 잘못된 값으로 적용되어 페이지가 과다 분할되는 회귀의 원인.
+            if let Some(start) = min_reflowed_idx {
+                crate::renderer::composer::recalculate_section_vpos(
+                    &mut section.paragraphs,
+                    start,
+                );
             }
         }
 
@@ -540,6 +587,12 @@ impl DocumentCore {
     /// 문서의 IR 참조를 반환한다 (네이티브 전용).
     pub fn document(&self) -> &Document {
         &self.document
+    }
+
+    /// [Task #741 후속] 문서의 IR mutable 참조를 반환한다.
+    /// WASM 영역 영역 외부 image inject 영역 의 영역 영역 영역.
+    pub fn document_mut(&mut self) -> &mut Document {
+        &mut self.document
     }
 
     /// 문서 IR을 직접 설정한다 (테스트/네이티브 전용).
@@ -840,7 +893,7 @@ mod validate_linesegs_tests {
         section.paragraphs.push(para);
         doc.sections.push(section);
 
-        let report = DocumentCore::validate_linesegs(&doc);
+        let report = DocumentCore::validate_linesegs(&doc, true);
         assert_eq!(report.len(), 1);
         assert_eq!(report.warnings[0].kind, WarningKind::LinesegArrayEmpty);
         assert_eq!(report.warnings[0].section_idx, 0);
@@ -859,7 +912,7 @@ mod validate_linesegs_tests {
         section.paragraphs.push(para);
         doc.sections.push(section);
 
-        let report = DocumentCore::validate_linesegs(&doc);
+        let report = DocumentCore::validate_linesegs(&doc, true);
         assert_eq!(report.len(), 1);
         assert_eq!(report.warnings[0].kind, WarningKind::LinesegUncomputed);
     }
@@ -877,7 +930,7 @@ mod validate_linesegs_tests {
         section.paragraphs.push(para);
         doc.sections.push(section);
 
-        let report = DocumentCore::validate_linesegs(&doc);
+        let report = DocumentCore::validate_linesegs(&doc, true);
         assert!(report.is_empty(), "healthy paragraph should not warn: {:?}", report.warnings);
     }
 
@@ -889,7 +942,7 @@ mod validate_linesegs_tests {
         section.paragraphs.push(Paragraph::default());
         doc.sections.push(section);
 
-        let report = DocumentCore::validate_linesegs(&doc);
+        let report = DocumentCore::validate_linesegs(&doc, true);
         assert!(report.is_empty());
     }
 
@@ -921,7 +974,7 @@ mod validate_linesegs_tests {
         section.paragraphs.push(outer_para);
         doc.sections.push(section);
 
-        let report = DocumentCore::validate_linesegs(&doc);
+        let report = DocumentCore::validate_linesegs(&doc, true);
         assert_eq!(report.len(), 1);
         assert_eq!(report.warnings[0].kind, WarningKind::LinesegArrayEmpty);
         let cp = report.warnings[0].cell_path.expect("cell_path should be set");
@@ -949,7 +1002,7 @@ mod validate_linesegs_tests {
         section.paragraphs.push(p2);
         doc.sections.push(section);
 
-        let report = DocumentCore::validate_linesegs(&doc);
+        let report = DocumentCore::validate_linesegs(&doc, true);
         assert_eq!(report.len(), 2);
         let summary = report.summary();
         assert_eq!(summary.get("lineseg 배열이 비어있음").copied(), Some(1));
@@ -1007,7 +1060,7 @@ mod validate_linesegs_tests {
         section.paragraphs.push(para);
         doc.sections.push(section);
 
-        let report = DocumentCore::validate_linesegs(&doc);
+        let report = DocumentCore::validate_linesegs(&doc, true);
         assert_eq!(report.len(), 1);
         assert_eq!(report.warnings[0].kind, WarningKind::LinesegTextRunReflow);
     }
@@ -1025,7 +1078,7 @@ mod validate_linesegs_tests {
         section.paragraphs.push(para);
         doc.sections.push(section);
 
-        let report = DocumentCore::validate_linesegs(&doc);
+        let report = DocumentCore::validate_linesegs(&doc, true);
         assert!(report.is_empty(), "짧은 문장은 경고 대상이 아님");
     }
 
@@ -1042,7 +1095,7 @@ mod validate_linesegs_tests {
         section.paragraphs.push(para);
         doc.sections.push(section);
 
-        let report = DocumentCore::validate_linesegs(&doc);
+        let report = DocumentCore::validate_linesegs(&doc, true);
         assert!(report.is_empty(), "\\n 있는 문단은 R3 해당 안 됨");
     }
 

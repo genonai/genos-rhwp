@@ -33,6 +33,10 @@ pub struct ComposedTextRun {
     pub char_overlap: Option<CharOverlapInfo>,
     /// 각주/미주 마커 (Some이면 위첨자로 렌더링, 텍스트 흐름에 포함)
     pub footnote_marker: Option<u16>,
+    /// PUA 옛한글 변환 후 표시 텍스트 (Some 이면 렌더러는 본 필드 사용).
+    /// `text` 는 IR 와 동일하게 PUA char 1글자로 보존하여 char_offsets /
+    /// char_start / line_chars 등 인덱싱 불변성을 유지한다 (Task #528).
+    pub display_text: Option<String>,
 }
 
 /// 구성된 줄 (LineSeg 기반)
@@ -93,8 +97,8 @@ pub struct ComposedParagraph {
     /// treat_as_char 컨트롤의 텍스트 위치와 HWPUNIT 너비 목록
     /// (para.text 내 절대 char 인덱스, 폭 HWPUNIT, para.controls 내 인덱스)
     pub tac_controls: Vec<(usize, i32, usize)>,
-    /// 각주/미주 위치: (텍스트 내 char 인덱스, 번호)
-    pub footnote_positions: Vec<(usize, u16)>,
+    /// 각주/미주 위치: (텍스트 내 char 인덱스, 번호, para.controls 내 인덱스)
+    pub footnote_positions: Vec<(usize, u16, usize)>,
     /// 탭 확장 데이터 (HWP tab_extended / HWPX 인라인 탭)
     /// ext[0]=width, ext[1]=leader/fill_type, ext[2]=tab_type
     pub tab_extended: Vec<[u16; 7]>,
@@ -145,12 +149,12 @@ pub fn compose_paragraph(para: &Paragraph) -> ComposedParagraph {
         .collect();
 
     // 각주/미주 위치 수집
-    let footnote_positions: Vec<(usize, u16)> = para.controls.iter().enumerate()
+    let footnote_positions: Vec<(usize, u16, usize)> = para.controls.iter().enumerate()
         .filter_map(|(i, ctrl)| {
             let pos = *tac_positions.get(i)?;
             match ctrl {
-                Control::Footnote(fn_) => Some((pos, fn_.number)),
-                Control::Endnote(en) => Some((pos, en.number)),
+                Control::Footnote(fn_) => Some((pos, fn_.number, i)),
+                Control::Endnote(en) => Some((pos, en.number, i)),
                 _ => None,
             }
         })
@@ -174,7 +178,45 @@ pub fn compose_paragraph(para: &Paragraph) -> ComposedParagraph {
     // PUA 테두리 숫자(사각형/원형 안의 숫자) → CharOverlap 런으로 변환
     convert_pua_enclosed_numbers(&mut composed);
 
+    // Hanyang-PUA 옛한글 / 한컴 PUA 표시 문자열 변환 (렌더링·측정용)
+    convert_pua_display_text(&mut composed);
+
     composed
+}
+
+/// Hanyang-PUA 옛한글 코드포인트와 한컴 PUA 표시 문자열을 렌더링용 텍스트로 변환한다.
+///
+/// 한컴 자체 폰트 (함초롬바탕 LVT 등) 는 PUA 영역에 옛한글 글리프를 직접
+/// 보유하나, OFL 폰트 (Noto Serif KR / Source Han Serif K 등) 는 KS X 1026-1
+/// 자모 영역만 지원하므로 PUA → 자모 변환 후 합자 렌더링이 필요.
+///
+/// `U+F012B` 같은 한컴 전용 PUA 기호는 표준 Unicode 단일 문자 대응이 없어서
+/// 표시 문자열(`(인)`)로 확장한다. 본 함수는 `run.text` 를 변경하지 않고
+/// `run.display_text` 에만 변환 결과를 저장한다. 이는 `char_offsets`,
+/// `line.char_start`, `line_chars` 등 인덱싱 불변성을 유지하기 위함이다
+/// (PUA 1 char = display N chars).
+///
+/// 매핑 표: KTUG HanyangPuaTableProject (Public Domain).
+fn convert_pua_display_text(composed: &mut ComposedParagraph) {
+    use super::pua_oldhangul::map_pua_old_hangul;
+    for line in composed.lines.iter_mut() {
+        for run in line.runs.iter_mut() {
+            if !run.text.chars().any(|ch| pua_plain_text_display(ch).is_some() || map_pua_old_hangul(ch).is_some()) {
+                continue;
+            }
+            let mut display = String::with_capacity(run.text.len() * 3);
+            for ch in run.text.chars() {
+                if let Some(replacement) = pua_plain_text_display(ch) {
+                    display.push_str(replacement);
+                } else if let Some(jamos) = map_pua_old_hangul(ch) {
+                    display.extend(jamos.iter().copied());
+                } else {
+                    display.push(ch);
+                }
+            }
+            run.display_text = Some(display);
+        }
+    }
 }
 
 /// 각주 마커를 해당 텍스트 위치의 런에 인라인 삽입
@@ -218,7 +260,7 @@ fn inject_footnote_markers(lines: &mut [ComposedLine], positions: &[(usize, u16)
                     lang_index: lang,
                     char_overlap: None,
                     footnote_marker: Some(number),
-                };
+                    display_text: None,                };
 
                 let mut new_runs = Vec::new();
                 // 앞부분에서 기존 런 교체
@@ -231,7 +273,7 @@ fn inject_footnote_markers(lines: &mut [ComposedLine], positions: &[(usize, u16)
                                 lang_index: lang,
                                 char_overlap: run.char_overlap.clone(),
                                 footnote_marker: None,
-                            });
+                                display_text: None,                            });
                         }
                         new_runs.push(marker_run.clone());
                         if !after.is_empty() {
@@ -241,7 +283,7 @@ fn inject_footnote_markers(lines: &mut [ComposedLine], positions: &[(usize, u16)
                                 lang_index: lang,
                                 char_overlap: run.char_overlap.clone(),
                                 footnote_marker: None,
-                            });
+                                display_text: None,                            });
                         }
                     } else {
                         new_runs.push(run.clone());
@@ -273,7 +315,7 @@ fn compose_lines(para: &Paragraph) -> Vec<ComposedLine> {
                 lang_index: 0,
                 char_overlap: None,
                     footnote_marker: None,
-            }]),
+                    display_text: None,            }]),
             line_height: 400,
             baseline_distance: 320,
             segment_width: 0,
@@ -463,47 +505,31 @@ fn split_by_char_shapes(
             lang_index: 0,
             char_overlap: None,
                     footnote_marker: None,
-        }]);
+                    display_text: None,        }]);
     }
 
     // 이 줄 범위에 영향을 미치는 CharShapeRef 찾기
-    // CharShapeRef.start_pos는 UTF-16 위치이므로 텍스트 인덱스로 변환해야 함
-    let line_utf16_start = if text_start < char_offsets.len() {
-        char_offsets[text_start]
-    } else if !char_offsets.is_empty() {
-        *char_offsets.last().unwrap() + 1
-    } else {
-        text_start as u32
-    };
-
-    let line_utf16_end = if text_end < char_offsets.len() {
-        char_offsets[text_end]
-    } else if !char_offsets.is_empty() {
-        *char_offsets.last().unwrap() + 1
-    } else {
-        text_end as u32
-    };
-
-    // 이 줄에 적용되는 CharShapeRef 구간 수집
-    // 각 구간: (텍스트 내 시작 인덱스, char_style_id)
+    //
+    // [Task #884] CharShapeRef.start_pos 를 visible char index 로 해석 (해석 B).
+    // 이전 해석 A (u16 stream 위치) 는 inline picture 등 다단위 컨트롤이 있는
+    // paragraph 에서 char_shape 적용 영역이 어긋났다 (예: table-in-tbox.hwp
+    // Shape.TextBox > Table > cell[0] " 충남중부권지사장" 의 id=20 HY수평선B 가
+    // visible[1] 부터 잘못 적용).
+    //
+    // 한컴 PDF 정합 확인된 해석:
+    //   text_idx = (cs.start_pos as usize) - text_start
+    //   단 cs.start_pos ≥ text.chars().count() 이면 미적용.
+    let total_chars = char_offsets.len();
     let mut segments: Vec<(usize, u32)> = Vec::new();
 
     for cs in char_shapes {
-        if cs.start_pos < line_utf16_end {
-            // 이 CharShapeRef의 시작 위치를 줄 내 텍스트 인덱스로 변환
-            let text_idx = if cs.start_pos <= line_utf16_start {
-                0 // 줄 시작 이전이면 0
-            } else {
-                // char_offsets에서 cs.start_pos에 해당하는 텍스트 인덱스 찾기
-                let global_idx = char_offsets
-                    .iter()
-                    .position(|&off| off >= cs.start_pos)
-                    .unwrap_or(text_end);
-                global_idx.saturating_sub(text_start)
-            };
-
-            segments.push((text_idx, cs.char_shape_id));
+        let cs_visible_idx = (cs.start_pos as usize).min(total_chars);
+        // cs 가 이 줄 범위 밖이면 skip
+        if cs_visible_idx >= text_end {
+            continue;
         }
+        let text_idx = cs_visible_idx.saturating_sub(text_start);
+        segments.push((text_idx, cs.char_shape_id));
     }
 
     // 시작 인덱스로 정렬 (동일 인덱스 내에서는 원래 순서 유지)
@@ -518,14 +544,14 @@ fn split_by_char_shapes(
     // segments가 비어있으면 첫 번째 CharShapeRef 사용
     if segments.is_empty() {
         // 줄 시작 위치 이전의 마지막 CharShapeRef 찾기
-        let style_id = find_active_char_shape(char_shapes, line_utf16_start);
+        let style_id = find_active_char_shape_visible(char_shapes, text_start);
         return split_runs_by_lang(vec![ComposedTextRun {
             text: line_text.to_string(),
             char_style_id: style_id,
             lang_index: 0,
             char_overlap: None,
                     footnote_marker: None,
-        }]);
+                    display_text: None,        }]);
     }
 
     // TextRun 생성
@@ -550,14 +576,14 @@ fn split_by_char_shapes(
                     lang_index: 0,
                     char_overlap: None,
                     footnote_marker: None,
-                });
+                    display_text: None,                });
             }
         }
     }
 
     // 첫 번째 segment가 0이 아닌 경우, 앞 부분 처리
     if !segments.is_empty() && segments[0].0 > 0 {
-        let style_id = find_active_char_shape(char_shapes, line_utf16_start);
+        let style_id = find_active_char_shape_visible(char_shapes, text_start);
         let end_idx = segments[0].0.min(chars.len());
         let prefix_text: String = chars[..end_idx].iter().collect();
         if !prefix_text.is_empty() {
@@ -569,20 +595,20 @@ fn split_by_char_shapes(
                     lang_index: 0,
                     char_overlap: None,
                     footnote_marker: None,
-                },
+                    display_text: None,                },
             );
         }
     }
 
     if runs.is_empty() {
-        let style_id = find_active_char_shape(char_shapes, line_utf16_start);
+        let style_id = find_active_char_shape_visible(char_shapes, text_start);
         runs.push(ComposedTextRun {
             text: line_text.to_string(),
             char_style_id: style_id,
             lang_index: 0,
             char_overlap: None,
                     footnote_marker: None,
-        });
+                    display_text: None,        });
     }
 
     // 언어 카테고리별로 Run을 세분화
@@ -590,10 +616,21 @@ fn split_by_char_shapes(
 }
 
 /// 주어진 UTF-16 위치에서 활성화된 CharShapeRef의 char_shape_id를 찾는다.
+///
+/// [Task #884] 해석 B 적용으로 start_pos 는 visible char index 이므로 이 함수의
+/// utf16_pos 인자는 의미가 모호해진다. 호출자가 char_offsets 통해 utf16 → visible
+/// idx 변환 후 [`find_active_char_shape_visible`] 사용 권장. 본 함수는 호환성을
+/// 위해 유지하나 향후 deprecate 예정.
 pub(crate) fn find_active_char_shape(char_shapes: &[CharShapeRef], utf16_pos: u32) -> u32 {
+    // utf16_pos 를 visible idx 로 직접 비교 (해석 B)
+    find_active_char_shape_visible(char_shapes, utf16_pos as usize)
+}
+
+/// [Task #884] visible char index 로 활성 char_shape 찾기
+pub(crate) fn find_active_char_shape_visible(char_shapes: &[CharShapeRef], visible_idx: usize) -> u32 {
     let mut active_id = char_shapes.first().map(|cs| cs.char_shape_id).unwrap_or(0);
     for cs in char_shapes {
-        if cs.start_pos <= utf16_pos {
+        if (cs.start_pos as usize) <= visible_idx {
             active_id = cs.char_shape_id;
         } else {
             break;
@@ -652,7 +689,7 @@ pub(crate) fn split_runs_by_lang(runs: Vec<ComposedTextRun>) -> Vec<ComposedText
                         lang_index: current_lang,
                         char_overlap: run.char_overlap.clone(),
                     footnote_marker: None,
-                    });
+                    display_text: None,                    });
                 }
                 current_lang = char_lang;
                 current_start = i;
@@ -668,7 +705,7 @@ pub(crate) fn split_runs_by_lang(runs: Vec<ComposedTextRun>) -> Vec<ComposedText
                 lang_index: current_lang,
                 char_overlap: run.char_overlap.clone(),
                     footnote_marker: None,
-            });
+                    display_text: None,            });
         }
     }
 
@@ -762,7 +799,7 @@ fn inject_char_overlap_text(composed: &mut ComposedParagraph, para: &Paragraph) 
                 inner_char_size: co.inner_char_size,
             }),
             footnote_marker: None,
-        }));
+            display_text: None,        }));
     }
 
     if insertions.is_empty() {
@@ -847,7 +884,7 @@ fn insert_overlap_run(
                         lang_index: lang_idx,
                         char_overlap: None,
                     footnote_marker: None,
-                    };
+                    display_text: None,                    };
 
                     // overlap_run과 after_run을 삽입
                     line.runs.insert(run_idx + 1, after_run);
@@ -879,14 +916,215 @@ fn insert_overlap_run(
 pub fn estimate_composed_line_width(line: &ComposedLine, styles: &ResolvedStyleSet) -> f64 {
     line.runs.iter().map(|run| {
         let ts = resolved_to_text_style(styles, run.char_style_id, run.lang_index);
-        estimate_text_width(&run.text, &ts)
+        estimate_text_width(effective_text_for_metrics(run), &ts)
     }).sum()
 }
 
-/// PUA Supplementary 영역(U+F0000~) 문자가 사각형/원형 테두리 숫자인지 판별한다.
+/// [Task #671] line_segs 비어 있는 셀 paragraph 의 단일 ComposedLine 압축
+/// 결과를 셀 가용 너비에 맞춰 다중 ComposedLine 으로 재분할한다.
+///
+/// 본질: HWP5 일부 파일은 셀 paragraph 의 PARA_LINE_SEG 를 인코딩하지 않는다
+/// (한컴이 layout 시 자동 계산). 본 환경 fallback (`compose_lines` 단일 ComposedLine
+/// 압축) 은 셀 너비를 초과하는 텍스트가 한 줄에 그려져 줄겹침 시각 결함을 발생.
+///
+/// 본 함수는 다음 가드로 동작 영역을 좁힌다:
+/// - `para.line_segs.is_empty()` (한컴 인코딩 부재)
+/// - `composed.lines.len() == 1` (compose_lines fallback 결과)
+/// - 단일 ComposedLine 의 측정 폭이 `cell_inner_width_px` 초과
+///
+/// 분할 전략: 단어 경계 (공백) 우선, 단어가 셀 너비 초과 시 글자 단위 break.
+pub fn recompose_for_cell_width(
+    composed: &mut ComposedParagraph,
+    para: &Paragraph,
+    cell_inner_width_px: f64,
+    styles: &ResolvedStyleSet,
+) {
+    if !para.line_segs.is_empty() {
+        return;
+    }
+    if composed.lines.len() != 1 {
+        return;
+    }
+    if cell_inner_width_px <= 0.0 {
+        return;
+    }
+    let single_line = composed.lines.remove(0);
+    let total_width = estimate_composed_line_width(&single_line, styles);
+    if total_width <= cell_inner_width_px + 0.5 {
+        composed.lines.push(single_line);
+        return;
+    }
+    composed.lines = split_composed_line_by_width(&single_line, cell_inner_width_px, styles);
+}
+
+/// 단일 ComposedLine 을 셀 가용 너비에 맞춰 다중 ComposedLine 으로 분할.
+///
+/// 분할 단위: 공백 단어 경계 우선, 단일 단어가 너비 초과 시 글자 단위 break.
+/// 각 분할 줄의 메타데이터 (line_height/baseline/segment_width 등) 는 원본 보존.
+fn split_composed_line_by_width(
+    src: &ComposedLine,
+    max_width_px: f64,
+    styles: &ResolvedStyleSet,
+) -> Vec<ComposedLine> {
+    let mut result: Vec<ComposedLine> = Vec::new();
+    let mut current_runs: Vec<ComposedTextRun> = Vec::new();
+    let mut current_width = 0.0;
+    let mut current_char_start = src.char_start;
+    let mut chars_in_line = 0usize;
+    let mut current_run_text = String::new();
+    let mut current_run_template: Option<ComposedTextRun> = None;
+
+    let flush_run = |runs: &mut Vec<ComposedTextRun>,
+                     text: &mut String,
+                     template: &Option<ComposedTextRun>| {
+        if !text.is_empty() {
+            if let Some(t) = template {
+                runs.push(ComposedTextRun {
+                    text: std::mem::take(text),
+                    char_style_id: t.char_style_id,
+                    lang_index: t.lang_index,
+                    char_overlap: t.char_overlap.clone(),
+                    footnote_marker: t.footnote_marker,
+                    display_text: None,
+                });
+            } else {
+                text.clear();
+            }
+        }
+    };
+
+    let push_line = |result: &mut Vec<ComposedLine>,
+                     runs: &mut Vec<ComposedTextRun>,
+                     current_char_start: &mut usize,
+                     chars_in_line: &mut usize,
+                     current_width: &mut f64| {
+        if !runs.is_empty() {
+            result.push(ComposedLine {
+                runs: std::mem::take(runs),
+                line_height: src.line_height,
+                baseline_distance: src.baseline_distance,
+                segment_width: src.segment_width,
+                column_start: src.column_start,
+                line_spacing: src.line_spacing,
+                has_line_break: false,
+                char_start: *current_char_start,
+            });
+            *current_char_start += *chars_in_line;
+            *chars_in_line = 0;
+            *current_width = 0.0;
+        }
+    };
+
+    for run in &src.runs {
+        let ts = resolved_to_text_style(styles, run.char_style_id, run.lang_index);
+        // 현재 run 의 template 변경 (char_style 다른 run 들 처리)
+        if current_run_template.as_ref().map(|t| {
+            t.char_style_id != run.char_style_id || t.lang_index != run.lang_index
+        }).unwrap_or(true) {
+            flush_run(&mut current_runs, &mut current_run_text, &current_run_template);
+            current_run_template = Some(run.clone());
+        }
+        // run 텍스트를 단어 단위로 분할 (공백 포함)
+        let mut word = String::new();
+        for ch in run.text.chars() {
+            word.push(ch);
+            // 공백 또는 마지막 글자 직전이 단어 경계
+            if ch == ' ' || ch == '\t' {
+                let word_width = estimate_text_width(&word, &ts);
+                // 현재 단어가 추가되면 max_width 초과하는지 검사
+                if current_width + word_width > max_width_px && (chars_in_line > 0 || !current_run_text.is_empty()) {
+                    // 현재 줄을 flush 후 새 줄 시작
+                    flush_run(&mut current_runs, &mut current_run_text, &current_run_template);
+                    push_line(&mut result, &mut current_runs, &mut current_char_start,
+                              &mut chars_in_line, &mut current_width);
+                }
+                // 단어 자체가 max_width 초과 시 글자 단위 break
+                if word_width > max_width_px && current_width == 0.0 {
+                    for wch in word.chars() {
+                        let wch_str: String = std::iter::once(wch).collect();
+                        let wch_width = estimate_text_width(&wch_str, &ts);
+                        if current_width + wch_width > max_width_px && chars_in_line > 0 {
+                            flush_run(&mut current_runs, &mut current_run_text, &current_run_template);
+                            push_line(&mut result, &mut current_runs, &mut current_char_start,
+                                      &mut chars_in_line, &mut current_width);
+                        }
+                        current_run_text.push(wch);
+                        current_width += wch_width;
+                        chars_in_line += 1;
+                    }
+                } else {
+                    current_run_text.push_str(&word);
+                    current_width += word_width;
+                    chars_in_line += word.chars().count();
+                }
+                word.clear();
+            }
+        }
+        // run 끝에 남은 단어 처리
+        if !word.is_empty() {
+            let word_width = estimate_text_width(&word, &ts);
+            if current_width + word_width > max_width_px && (chars_in_line > 0 || !current_run_text.is_empty()) {
+                flush_run(&mut current_runs, &mut current_run_text, &current_run_template);
+                push_line(&mut result, &mut current_runs, &mut current_char_start,
+                          &mut chars_in_line, &mut current_width);
+            }
+            // 단어 자체가 max_width 초과 시 글자 단위 break
+            if word_width > max_width_px && current_width == 0.0 {
+                for wch in word.chars() {
+                    let wch_str: String = std::iter::once(wch).collect();
+                    let wch_width = estimate_text_width(&wch_str, &ts);
+                    if current_width + wch_width > max_width_px && chars_in_line > 0 {
+                        flush_run(&mut current_runs, &mut current_run_text, &current_run_template);
+                        push_line(&mut result, &mut current_runs, &mut current_char_start,
+                                  &mut chars_in_line, &mut current_width);
+                    }
+                    current_run_text.push(wch);
+                    current_width += wch_width;
+                    chars_in_line += 1;
+                }
+            } else {
+                current_run_text.push_str(&word);
+                current_width += word_width;
+                chars_in_line += word.chars().count();
+            }
+        }
+    }
+    // 마지막 줄 flush
+    flush_run(&mut current_runs, &mut current_run_text, &current_run_template);
+    push_line(&mut result, &mut current_runs, &mut current_char_start,
+              &mut chars_in_line, &mut current_width);
+
+    if result.is_empty() {
+        // 안전장치: 절대 빈 결과 반환하지 않음
+        result.push(src.clone());
+    }
+    result
+}
+
+/// [Task #555] 폰트 매트릭스 (글자폭/줄간격) 계산용 effective text 반환.
+///
+/// PUA 옛한글 변환 (Task #528) 후 `run.display_text` 가 자모 시퀀스를 보유하면
+/// 본 함수는 그 자모 시퀀스를 반환한다. 그렇지 않으면 `run.text` (PUA char 1글자
+/// 또는 일반 텍스트) 를 그대로 반환.
+///
+/// 사용처: `estimate_text_width` / `estimate_composed_line_width` 등 폰트 매트릭스
+/// 측정 함수의 caller. visual 출력 (svg/web_canvas) 은 이미 `display_text` 사용.
+///
+/// 단일 룰 (분기/허용오차 없음): 비-PUA 텍스트는 fallback 으로 동일 동작.
+pub fn effective_text_for_metrics(run: &ComposedTextRun) -> &str {
+    // Issue #677: U+F081C 는 HWP TAC filler 이며 text_measurement 경로에서
+    // 시각 폭 0으로 처리해야 한다. display_text 로 바꾸면 이 0폭 규칙을
+    // 우회하므로 원문을 유지한다.
+    if run.text.contains('\u{F081C}') {
+        return &run.text;
+    }
+    run.display_text.as_deref().unwrap_or(&run.text)
+}
+
+/// PUA Supplementary 영역(U+F0000~) 문자가 테두리 숫자인지 판별한다.
 ///
 /// HWP 특수문자표에서 표준 Unicode가 없는 테두리 숫자를 PUA로 인코딩한다.
-/// - U+F02B1~U+F02C4: 사각형 안의 숫자 1~20 (border_type=3)
+/// - U+F02B1~U+F02C4: map_pua_bullet_char 에서 ①~⑳ 으로 매핑 (CharOverlap 제외)
 /// - U+F02CE~U+F02E1: 반전 사각형 안의 숫자 1~20 (border_type=4)
 ///
 /// 반환: Some(border_type) 또는 None
@@ -935,10 +1173,7 @@ pub fn decode_pua_overlap_number(chars: &[char]) -> Option<String> {
 
 fn pua_enclosed_border_type(ch: char) -> Option<u8> {
     let cp = ch as u32;
-    // 사각형 안의 숫자: U+F02B1(1) ~ U+F02C4(20)
-    if (0xF02B1..=0xF02C4).contains(&cp) {
-        return Some(3); // border_type=3: 사각형
-    }
+    // U+F02B1~F02C4 (①~⑳): map_pua_bullet_char 에서 표준 원문자로 매핑 — CharOverlap 제외
     // 반전 사각형 안의 숫자: U+F02CE(1) ~ U+F02E1(20)
     if (0xF02CE..=0xF02E1).contains(&cp) {
         return Some(4); // border_type=4: 반전 사각형
@@ -946,16 +1181,44 @@ fn pua_enclosed_border_type(ch: char) -> Option<u8> {
     None
 }
 
-/// PUA 테두리 숫자 문자를 표시 문자열로 변환한다. (렌더러 전용)
+fn pua_plain_text_display(ch: char) -> Option<&'static str> {
+    match ch as u32 {
+        0xF012B => Some("(인)"),
+        _ => None,
+    }
+}
+
+/// 일반 텍스트 렌더링 경로에서 한컴 PUA 문자를 표시 문자열로 확장한다.
+///
+/// HWP TAC filler `U+F081C` 는 레이아웃 측정에는 원문으로 남겨 0폭 규칙을
+/// 적용하되, 실제 출력에서는 글리프가 없어 깨진 문자로 보이지 않도록 숨긴다.
+///
+/// CharOverlap 전용 숫자(`U+F02CE..=U+F02E1`)는 여기서 확장하지 않는다.
+/// 해당 문자는 `pua_to_display_text()`가 글자겹침 렌더러에서만 처리한다.
+pub fn expand_pua_render_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '\u{F081C}' {
+            continue;
+        }
+        if let Some(replacement) = pua_plain_text_display(ch) {
+            out.push_str(replacement);
+        } else {
+            out.push(super::layout::map_pua_bullet_char(ch));
+        }
+    }
+    out
+}
+
+/// PUA 테두리 숫자와 한컴 PUA 기호를 표시 문자열로 변환한다. (렌더러 전용)
 ///
 /// draw_char_overlap()에서 호출하여, 실제 렌더링 시에만 변환한다.
 pub fn pua_to_display_text(ch: char) -> Option<String> {
     let cp = ch as u32;
-    // 사각형 안의 숫자: U+F02B1(1) ~ U+F02C4(20)
-    if (0xF02B1..=0xF02C4).contains(&cp) {
-        let num = cp - 0xF02B0;
-        return Some(format!("{}", num));
+    if let Some(replacement) = pua_plain_text_display(ch) {
+        return Some(replacement.to_string());
     }
+    // U+F02B1~F02C4 는 map_pua_bullet_char 에서 ①~⑳ 으로 매핑 — 여기 도달 불가
     // 반전 사각형 안의 숫자: U+F02CE(1) ~ U+F02E1(20)
     if (0xF02CE..=0xF02E1).contains(&cp) {
         let num = cp - 0xF02CD;
@@ -1003,7 +1266,7 @@ fn convert_pua_enclosed_numbers(composed: &mut ComposedParagraph) {
                             lang_index: run.lang_index,
                             char_overlap: None,
                     footnote_marker: None,
-                        });
+                    display_text: None,                        });
                         buf.clear();
                     }
                     // PUA 문자 그대로 유지 + CharOverlapInfo 부착
@@ -1016,7 +1279,7 @@ fn convert_pua_enclosed_numbers(composed: &mut ComposedParagraph) {
                             inner_char_size: 0,
                         }),
                         footnote_marker: None,
-                    });
+                        display_text: None,                    });
                 } else {
                     buf.push(ch);
                 }
@@ -1030,7 +1293,7 @@ fn convert_pua_enclosed_numbers(composed: &mut ComposedParagraph) {
                     lang_index: run.lang_index,
                     char_overlap: None,
                     footnote_marker: None,
-                });
+                    display_text: None,                });
             }
         }
 

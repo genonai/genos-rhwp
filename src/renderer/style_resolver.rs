@@ -266,7 +266,7 @@ impl Default for ResolvedBorderStyle {
 }
 
 /// 해소된 스타일 세트 (DocInfo에서 변환)
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ResolvedStyleSet {
     /// 글자 스타일 목록 (char_shapes[id]에 대응)
     pub char_styles: Vec<ResolvedCharStyle>,
@@ -598,6 +598,9 @@ fn resolve_ttf_font(name: &str) -> Option<&'static str> {
 /// regular weight fallback 으로 떨어지면 PDF(한컴) 출력과 시각 괴리가
 /// 발생하므로, 이 리스트에 포함된 face 는 SVG 에서 font-weight="bold"
 /// 를 강제해 fallback bold variant 로 근사 렌더한다.
+///
+/// Task #574: HY견명조 는 한컴 일반 두께 명조 — heavy 가 아님. 제거.
+/// HY견명조B (명시 Bold variant) 는 보존.
 pub(crate) fn is_heavy_display_face(font_family: &str) -> bool {
     // font_family 는 "HY헤드라인M,'Malgun Gothic',..." 처럼 CSS 체인 형태.
     // 첫 face 만 검사 (HWP 가 지정한 primary face).
@@ -607,9 +610,23 @@ pub(crate) fn is_heavy_display_face(font_family: &str) -> bool {
         .trim_matches('"');
     matches!(primary,
         "HY헤드라인M" | "HYHeadLine M" | "HYHeadLine Medium"
-        | "HY견고딕" | "HY견명조" | "HY견명조B"
+        | "HY견고딕" | "HY견명조B"
         | "HY그래픽" | "HY그래픽M"
     )
+}
+
+/// 중고딕/태고딕 계열 (CSS font-weight 500) 폰트 판별.
+///
+/// HWP 에서 중고딕 계열은 Regular(400)과 Bold(700) 사이의 Medium(500) weight.
+/// Fallback 폰트 매칭 시 weight 500 힌트를 주어 선명도를 유지한다.
+pub(crate) fn is_medium_weight_face(font_family: &str) -> bool {
+    let primary = font_family.split(',').next().unwrap_or(font_family)
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"');
+    let lower = primary.to_lowercase();
+    lower.contains("중고딕") || lower.contains("태고딕")
+        || lower.contains("mediumgothic") || lower.contains("hymedium")
 }
 
 /// ParaShape → ResolvedParaStyle 목록
@@ -692,9 +709,10 @@ fn resolve_border_styles(doc_info: &DocInfo) -> Vec<ResolvedBorderStyle> {
 fn resolve_single_border_style(bf: &BorderFill) -> ResolvedBorderStyle {
     let fill_color = match bf.fill.fill_type {
         FillType::Solid => bf.fill.solid.as_ref().and_then(|s| {
+            // pattern_type > 0: 패턴 채우기 → 단색 fill 아님 (background_color는 패턴 배경)
             // ColorRef 상위 바이트가 0이 아니면 "채우기 없음" (투명)
             // 0xFFFFFFFF = CLR_INVALID/CLR_DEFAULT (Windows COLORREF)
-            if (s.background_color >> 24) != 0 {
+            if s.pattern_type > 0 || (s.background_color >> 24) != 0 {
                 None
             } else {
                 Some(s.background_color)

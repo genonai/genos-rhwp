@@ -9,6 +9,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - WebAssembly(WASM)로 빌드하여 웹브라우저에서 HWP 문서를 볼 수 있도록 함
 - 한컴 웹기안기의 오픈소스 대안
 
+### 파일 포맷별 파서 구조
+
+공통 문서 모델은 `src/model/document.rs`의 `Document` 구조체이다. 모든 포맷 파서는 이 하나의 `Document` IR로 변환하여 반환한다.
+
+| 포맷 | 파서 위치 | 출력 IR |
+|------|----------|---------|
+| HWPX (ZIP+XML) | `src/parser/hwpx/` | `Document` |
+| HWP5 (OLE 복합) | `src/parser/hwp5/` | `Document` |
+| HWP3 (고전 바이너리) | `src/parser/hwp3/` | `Document` |
+
+> 역사적으로 `Document` 모델은 HWP5 형식의 구조를 기반으로 설계되었으며, HWPX는 같은 의미의 XML 포맷이다. HWP3는 고전 포맷이지만 동일한 `Document` IR로 변환한다.
+
+**HWP3 파서 규칙**: `src/parser/hwp3/` 내부에서 HWP3 바이너리를 읽어 `Document` IR로 변환하여 반환한다. HWP3 전용 로직은 **반드시 `src/parser/hwp3/` 안에서만** 구현한다. 렌더러(`src/renderer/`), 레이아웃(`src/renderer/layout.rs`), 문서 코어(`src/document_core/`) 등 공통 모듈에 HWP3 전용 분기를 추가하지 않는다.
+
 ## 클로드 코드 사용 시 주의사항
 
 이 프로젝트는 **하이퍼-워터폴** 방법론을 적용한다. 클로드 코드의 기본 동작(빠른 실행, 자율 수정)과 충돌이 발생할 수 있으므로 반드시 숙지한다.
@@ -199,9 +213,13 @@ rhwp ir-diff sample.hwpx sample.hwp                    # 전체 비교
 rhwp ir-diff sample.hwpx sample.hwp -s 0 -p 810        # 특정 문단만 비교
 rhwp ir-diff sample.hwpx sample.hwp 2>&1 | grep "\[PS " # ParaShape 차이만
 rhwp ir-diff sample.hwpx sample.hwp 2>&1 | tail -1      # 차이 건수만
+rhwp ir-diff sample.hwpx sample.hwp --summary           # 카테고리별 카운트
+rhwp ir-diff sample.hwpx sample.hwp --max-lines 50      # 출력 50줄 제한
 ```
 
-비교 항목: text, char_count, char_offsets, char_shapes, line_segs, controls, tab_extended, ParaShape(여백/줄간격/탭), TabDef(위치/종류/채움).
+비교 항목: text, char_count, char_offsets, char_shapes, line_segs, controls(타입+속성), tab_extended, ParaShape(여백/줄간격/탭), TabDef(위치/종류/채움).
+표: page_break, outer_margin, treat_as_char, wrap, size, v_offset/h_offset 비교.
+그림/도형: treat_as_char, wrap, size, v_offset/h_offset, vert_rel/horz_rel 비교.
 
 상세 매뉴얼: `mydocs/manual/ir_diff_command.md`
 
@@ -227,7 +245,41 @@ HWPX↔HWP 불일치 디버깅 시 추가 단계:
 
 ### 예제 폴더
 
-- `samples/` - 테스트용 HWP 파일
+- `samples/` - 테스트용 HWP/HWPX 파일 (git tracked 영구 보존)
+- `pdf/` - 한글 **2022** 편집기 PDF 변환본 (PR #670, 시각 정합성 비교 권위 자료, < 50 MB)
+- `pdf-2020/` - (예정) 한글 2020 편집기 PDF 변환본 (< 50 MB)
+- `pdf-2010/` - (예정) 한글 2010 편집기 PDF 변환본 (< 50 MB)
+- `pdf-large/` - **대용량 PDF (≥ 50 MB, Git LFS 추적)** — GitHub 권장 50 MB 초과 PDF 영역 영역 격리 (PR #753, hwp3-sample10 영역)
+
+### PDF 권위 자료 명명 규약
+
+| 폴더 | 한컴 버전 | 명명 패턴 | 처리 |
+|------|----------|----------|------|
+| `pdf/` | 한글 2022 | `pdf/{원본 stem}-2022.pdf` | 일반 git |
+| `pdf-2020/` | 한글 2020 | `pdf-2020/{원본 stem}-2020.pdf` | 일반 git |
+| `pdf-2010/` | 한글 2010 | `pdf-2010/{원본 stem}-2010.pdf` | 일반 git |
+| `pdf-large/` | 모든 버전 | `pdf-large/{원본 stem}-{버전}.pdf` | **Git LFS** |
+
+원본 파일이 하위 폴더 (`samples/basic/` / `samples/hwpx/`) 에 있는 경우 PDF 도 동일 하위 폴더 구조 유지. 상세는 `pdf/README.md` / `pdf-large/README.md`.
+
+50 MB 초과 PDF 는 반드시 `pdf-large/` 영역 영역 배치 — `.gitattributes` 의 `pdf-large/**/*.pdf filter=lfs` 패턴 영역 영역 자동 LFS 변환. Clone / Fork 시 LFS 미설치 환경 영역 영역 placeholder 만 진입 영역 영역, 실제 PDF 영역 영역 `git lfs install && git lfs pull` 영역 영역 받음.
+
+### PDF 권위 등급 (컨트리뷰터 환경별)
+
+본 프로젝트의 시각 판정 권위 영역은 컨트리뷰터 환경에 따라 다르다 (`reference_authoritative_hancom` 메모리 룰 정합):
+
+**Windows + 한컴 편집기 환경**:
+- 1차 정답지: 한글 2010 / 2020 / 2022 **편집기** 직접 출력 (시각 판정)
+- 보조: `pdf/`, `pdf-2020/`, `pdf-2010/` 의 PDF
+
+**macOS / Linux 환경 (한컴 편집기 미접근)**:
+- 1차 정답지: `pdf/` (한글 2022) 또는 `pdf-2020/` (한글 2020) PDF
+- 등급 미달: `pdf-2010/` (한글 2010 PDF) — 보조 자료, 정답지 등급 미달
+
+**모든 환경 공통 — 정답지 아님**:
+- 한컴 뷰어 출력
+- macOS 인쇄 / 외부 변환
+- HWP5 v2024 변환본 등 한컴 변환 산출물 (비교 보조 자료)
 
 ### 출력 폴더
 

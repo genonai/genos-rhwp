@@ -11,6 +11,8 @@ export interface DocumentInfo {
 /** WASM getPageInfo() 반환 타입 */
 export interface PageInfo {
   pageIndex: number;
+  /** 조판 기준으로 계산된 표시용 쪽 번호(구역 설정 반영) */
+  pageNumber?: number;
   width: number;
   height: number;
   sectionIndex: number;
@@ -108,6 +110,38 @@ export interface HitTestResult {
   fieldId?: number;
   /** 필드 타입 ("clickhere" 등) */
   fieldType?: string;
+}
+
+/** WASM hitTestBodyFootnoteMarker() 반환 타입 */
+export interface BodyFootnoteMarkerHit {
+  hit: boolean;
+  sectionIndex?: number;
+  paragraphIndex?: number;
+  controlIndex?: number;
+  footnoteNumber?: number;
+  footnoteIndex?: number;
+  bbox?: { x: number; y: number; w: number; h: number };
+  cursorRect?: CursorRect;
+}
+
+/** WASM getFootnoteAtCursor() 반환 타입 */
+export interface FootnoteAtCursorResult {
+  hit: boolean;
+  sectionIndex?: number;
+  paragraphIndex?: number;
+  controlIndex?: number;
+  charOffset?: number;
+  footnoteNumber?: number;
+}
+
+/** WASM deleteFootnote() 반환 타입 */
+export interface DeleteFootnoteResult {
+  ok: boolean;
+  sectionIndex: number;
+  paragraphIndex: number;
+  controlIndex: number;
+  charOffset: number;
+  deletedNumber: number;
 }
 
 /** 커서 위치의 필드 범위 정보 */
@@ -501,6 +535,8 @@ export interface PictureProperties {
   captionSpacing: number;
   captionMaxWidth: number;
   captionIncludeMargin: boolean;
+  /** [Task #741 후속] 외부 file path (HWP3 외부 그림). 부재 시 문서 포함 그림. */
+  externalPath?: string;
 }
 
 /** 양식 개체 히트 결과 */
@@ -560,6 +596,22 @@ export interface SearchResult {
   para?: number;
   charOffset?: number;
   length?: number;
+  cellContext?: {
+    parentPara: number;
+    ctrlIdx: number;
+    cellIdx: number;
+    cellPara: number;
+  };
+}
+
+/** 전체 검색 결과 항목 */
+export interface SearchHit {
+  sec: number;
+  /** 본문 매치: 문단 인덱스. 셀 매치: 부모(호스트) 문단 인덱스 (= cellContext.parentPara) */
+  para: number;
+  charOffset: number;
+  length: number;
+  /** 표 셀/글상자 내부 매치 시 컨텍스트. cellPara가 실제 매치 문단 인덱스 */
   cellContext?: {
     parentPara: number;
     ctrlIdx: number;

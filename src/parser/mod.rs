@@ -26,6 +26,8 @@ pub mod doc_info;
 pub mod header;
 pub mod hwpml;
 pub mod hwpx;
+pub mod hwp3;
+pub mod ingest;
 pub mod record;
 pub mod tags;
 
@@ -113,6 +115,7 @@ pub enum ParseError {
     BodyTextError(body_text::BodyTextError),
     CryptoError(crypto::CryptoError),
     HwpxError(hwpx::HwpxError),
+    Hwp3Error(hwp3::Hwp3Error),
     EncryptedDocument,
     /// 감지는 되었으나 지원하지 않는 포맷 (Issue #265)
     UnsupportedFormat { format: &'static str, hint: &'static str },
@@ -127,6 +130,7 @@ impl std::fmt::Display for ParseError {
             ParseError::BodyTextError(e) => write!(f, "BodyText 오류: {}", e),
             ParseError::CryptoError(e) => write!(f, "암호 오류: {}", e),
             ParseError::HwpxError(e) => write!(f, "HWPX 오류: {}", e),
+            ParseError::Hwp3Error(e) => write!(f, "HWP 3.0 오류: {}", e),
             ParseError::EncryptedDocument => write!(f, "암호화된 문서는 지원하지 않습니다"),
             ParseError::UnsupportedFormat { format, hint } =>
                 write!(f, "지원하지 않는 포맷입니다: {format}. {hint}"),
@@ -139,6 +143,12 @@ impl std::error::Error for ParseError {}
 impl From<hwpx::HwpxError> for ParseError {
     fn from(e: hwpx::HwpxError) -> Self {
         ParseError::HwpxError(e)
+    }
+}
+
+impl From<hwp3::Hwp3Error> for ParseError {
+    fn from(e: hwp3::Hwp3Error) -> Self {
+        ParseError::Hwp3Error(e)
     }
 }
 
@@ -221,7 +231,48 @@ fn parse_hwp_with_cfb(mut cfb: cfb_reader::CfbReader, _raw_data: &[u8]) -> Resul
     // 자동 번호 할당 (문서 전체에서 순차적으로)
     assign_auto_numbers(&mut doc);
 
+    // [Task #554] HWP3 → HWP5 변환본 식별 + page_def margin_bottom 보정
+    apply_hwp3_origin_fixup(&mut doc);
+
+    // [Task #873] BinData Link 타입 의 외부 file path 영역 Picture.external_path 전달.
+    // 이후 model::document::populate_external_images_from_dir (Task #741) 가 같은
+    // dir 영역 basename 매칭 영역 image 영역 자동 load.
+    populate_link_image_paths(&mut doc);
+
     Ok(doc)
+}
+
+/// [Task #554] HWP3 → HWP5/HWPX 변환본 식별 휴리스틱 + 페이지 여백 보정
+///
+/// 한컴이 HWP3 → HWP5 로 변환할 때 한글97의 "마지막 줄 tolerance" (1600 HU)
+/// 동작이 누락되어 페이지 수가 +1 ~ +4 증가한다. 변환본을 식별 후 모든
+/// SectionDef.page_def.margin_bottom 을 1600 HU 줄여 한글97 페이지네이션과 정합.
+///
+/// ## 식별 휴리스틱 (Task #554 진단 결과)
+///
+/// 한컴은 HWP3 → HWP5 변환 시 ParaShape/CharShape 를 거의 재사용하지 않고 매우
+/// 적은 수만 생성하여 paragraph 대비 비율이 극도로 낮다. 직접 작성본은 작성자가
+/// 다양한 스타일을 사용하므로 비율이 paragraph 와 비슷하거나 더 높다.
+///
+/// - **`ParaShape/Paragraph < 0.05` AND `CharShape/Paragraph < 0.15`** → 변환본
+/// - **`Paragraph > 50`** 가드: 매우 짧은 문서는 비율이 왜곡되므로 제외
+///
+/// 27 fixture 검증에서 100% 정확 분류 (Stage 1 보고서 §3.2 참조).
+fn apply_hwp3_origin_fixup(doc: &mut Document) {
+    let total_paragraphs: usize = doc.sections.iter()
+        .map(|s| s.paragraphs.len())
+        .sum();
+    if total_paragraphs <= 50 {
+        return;
+    }
+    let ps_ratio = doc.doc_info.para_shapes.len() as f64 / total_paragraphs as f64;
+    let cs_ratio = doc.doc_info.char_shapes.len() as f64 / total_paragraphs as f64;
+    if ps_ratio < 0.05 && cs_ratio < 0.15 {
+        for section in doc.sections.iter_mut() {
+            section.section_def.page_def.margin_bottom =
+                section.section_def.page_def.margin_bottom.saturating_sub(1600);
+        }
+    }
 }
 
 /// CfbReader로 섹션들 파싱
@@ -341,6 +392,14 @@ fn parse_hwp_with_lenient(lenient: cfb_reader::LenientCfbReader, _raw_data: &[u8
 
     assign_auto_numbers(&mut doc);
 
+    // [Task #554] HWP3 → HWP5 변환본 식별 + page_def margin_bottom 보정
+    apply_hwp3_origin_fixup(&mut doc);
+
+    // [Task #873] BinData Link 타입 의 외부 file path 영역 Picture.external_path 전달.
+    // 이후 model::document::populate_external_images_from_dir (Task #741) 가 같은
+    // dir 영역 basename 매칭 영역 image 영역 자동 load.
+    populate_link_image_paths(&mut doc);
+
     Ok(doc)
 }
 
@@ -397,6 +456,49 @@ fn load_bin_data_content_lenient(
     contents
 }
 
+/// [Task #873] BinData Link 타입의 외부 file path 를 Picture.image_attr.external_path
+/// 로 전달. 모든 포맷 (HWP5/HWPX) 공통 — HWP3 는 파서 내부에서 직접 설정 (Task #741).
+///
+/// HWP5 의 BinDataType::Link entry, HWPX 의 isEmbeded="0" item 이 abs_path/rel_path
+/// 보유. 본 함수는 Picture.bin_data_id 로 BinData entry lookup → Link 인 경우
+/// external_path 설정. 이후 populate_external_images_from_dir (model/document.rs) 가
+/// HWP 파일 디렉토리에서 basename 매칭으로 실제 image 로드.
+pub(crate) fn populate_link_image_paths(doc: &mut Document) {
+    use crate::model::bin_data::BinDataType;
+    use crate::model::control::Control;
+    use crate::model::shape::ShapeObject;
+
+    let bin_data = doc.doc_info.bin_data_list.clone();
+    for section in &mut doc.sections {
+        for para in &mut section.paragraphs {
+            for ctrl in &mut para.controls {
+                let pic = match ctrl {
+                    Control::Picture(p) => p,
+                    Control::Shape(s) => match s.as_mut() {
+                        ShapeObject::Picture(p) => p,
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                if pic.image_attr.external_path.is_some() {
+                    continue;
+                }
+                let bin_idx = (pic.image_attr.bin_data_id as usize).saturating_sub(1);
+                if let Some(bd) = bin_data.get(bin_idx) {
+                    if matches!(bd.data_type, BinDataType::Link) {
+                        let path = bd.abs_path.clone()
+                            .filter(|p| !p.is_empty())
+                            .or_else(|| bd.rel_path.clone().filter(|p| !p.is_empty()));
+                        if let Some(p) = path {
+                            pic.image_attr.external_path = Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// 문서 내 모든 AutoNumber 컨트롤에 번호를 할당한다.
 /// NewNumber 컨트롤을 만나면 해당 종류의 카운터를 리셋한다.
 pub(crate) fn assign_auto_numbers(doc: &mut Document) {
@@ -447,7 +549,6 @@ pub(crate) fn assign_auto_numbers(doc: &mut Document) {
     }
 }
 
-/// 컨트롤 목록에서 AutoNumber를 찾아 번호를 할당한다.
 fn assign_auto_numbers_in_controls(
     controls: &mut [crate::model::control::Control],
     counters: &mut [u16; 6],
@@ -564,17 +665,21 @@ impl DocumentParser for HwpxParser {
     }
 }
 
+/// HWP 3.0 파서
+pub struct Hwp3Parser;
+
+impl DocumentParser for Hwp3Parser {
+    fn parse(&self, data: &[u8]) -> Result<Document, ParseError> {
+        hwp3::parse_hwp3(data).map_err(ParseError::from)
+    }
+}
+
 /// 포맷 자동 감지 후 적절한 파서로 파싱
 pub fn parse_document(data: &[u8]) -> Result<Document, ParseError> {
     match detect_format(data) {
         FileFormat::Hwpml => hwpml::parse_hwpml(data).map_err(ParseError::from),
         FileFormat::Hwpx => HwpxParser.parse(data),
-        FileFormat::Hwp3 => Err(ParseError::UnsupportedFormat {
-            format: "HWP 3.0",
-            hint: "현재 rhwp 는 HWP 5.0 과 HWPX 만 지원합니다. \
-                   한컴오피스 또는 LibreOffice 에서 파일을 연 뒤 \
-                   HWP 5.0 포맷으로 다시 저장하여 시도해주세요.",
-        }),
+        FileFormat::Hwp3 => Hwp3Parser.parse(data),
         _ => HwpParser.parse(data),
     }
 }
@@ -920,31 +1025,25 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_document_hwp3_returns_unsupported_error() {
-        // Issue #265: HWP 3.0 헤더 → UnsupportedFormat 에러
+    fn test_parse_document_hwp3_too_short_errors() {
+        // Issue #265 (updated): HWP 3.0 헤더 (now supported, but data is incomplete)
         let hwp3_header = b"HWP Document File V3.00 \x1a\x01\x02\x03\x04\x05";
         let err = parse_document(hwp3_header).unwrap_err();
         match err {
-            ParseError::UnsupportedFormat { format, hint } => {
-                assert_eq!(format, "HWP 3.0");
-                assert!(hint.contains("HWP 5.0"));
-            }
-            other => panic!("expected UnsupportedFormat, got {other:?}"),
+            ParseError::Hwp3Error(_) => {}
+            other => panic!("expected Hwp3Error, got {other:?}"),
         }
     }
 
     #[test]
     fn test_parse_document_issue_265_sample() {
         // Issue #265: 실제 제보 파일 samples/issue_265.hwp 가 HWP 3.0 으로
-        // 감지되고 친절한 에러 메시지를 반환하는지 확인.
+        // 감지되고 정상적으로 파싱되는지 확인.
         let data = std::fs::read("samples/issue_265.hwp")
             .expect("samples/issue_265.hwp should exist in repo");
         assert_eq!(detect_format(&data), FileFormat::Hwp3);
-        let err = parse_document(&data).unwrap_err();
-        assert!(matches!(err, ParseError::UnsupportedFormat { .. }));
-        let msg = format!("{err}");
-        assert!(msg.contains("HWP 3.0"), "message should mention HWP 3.0: {msg}");
-        assert!(msg.contains("HWP 5.0"), "message should mention HWP 5.0: {msg}");
+        let doc = parse_document(&data).expect("Should successfully parse HWP3 sample");
+        assert!(doc.sections.len() > 0, "Document should have at least one section");
     }
 
     #[test]

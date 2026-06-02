@@ -12,15 +12,18 @@ use crate::model::control::Control;
 use crate::model::shape::CaptionDirection;
 use crate::model::header_footer::HeaderFooterApply;
 use crate::model::paragraph::{Paragraph, ColumnBreakType};
-use crate::model::page::{PageDef, ColumnDef};
+use crate::model::page::{PageDef, ColumnDef, ColumnType};
 use crate::renderer::composer::ComposedParagraph;
 use crate::renderer::height_measurer::MeasuredTable;
 use crate::renderer::page_layout::PageLayoutInfo;
 use crate::renderer::style_resolver::ResolvedStyleSet;
 use crate::renderer::{hwpunit_to_px, DEFAULT_DPI};
+
+// [Task #836] 미주 paragraph의 가상 para_index = paragraphs.len() + endnote 내 순번.
+// rendering.rs에서 paragraphs + endnote_paragraphs를 합쳐서 전달.
 use super::pagination::{
     PaginationResult, PageContent, ColumnContent, PageItem,
-    HeaderFooterRef, FootnoteRef, FootnoteSource,
+    HeaderFooterRef, FootnoteRef, FootnoteSource, EndnoteRef,
 };
 
 // ========================================================
@@ -132,15 +135,43 @@ struct TypesetState {
     hidden_empty_page_idx: usize,
     /// [Task #362] hide_empty_line 으로 감춘 paragraph 인덱스 (PaginationResult 에 포함).
     hidden_empty_paras: std::collections::HashSet<usize>,
+    /// [Task #836] 미주 목록 (섹션별 수집, 문서 끝에 렌더).
+    endnotes: Vec<EndnoteRef>,
+    endnote_paragraphs: Vec<Paragraph>,
     /// [Task #362] Square wrap 표의 column_start (HU). -1 = 비활성. 후속 같은 cs/sw paragraph 흡수용.
     wrap_around_cs: i32,
     /// [Task #362] Square wrap 표의 segment_width (HU). -1 = 비활성.
     wrap_around_sw: i32,
     /// [Task #362] Square wrap 표가 있는 paragraph 인덱스 (WrapAroundPara 에 기록).
     wrap_around_table_para: usize,
+    /// 비-TAC Picture/Shape Square wrap: any_seg_matches만으로 후속 문단 판정 허용.
+    /// 그림의 lineseg는 첫 seg cs=0일 수 있어 전체 seg 중 하나라도 일치하면 흡수.
+    wrap_around_any_seg: bool,
     /// [Task #362] 현재 단에서 표 옆에 배치되는 wrap-around paragraphs.
     /// flush_column 에서 ColumnContent 로 전달.
     current_column_wrap_around_paras: Vec<crate::renderer::pagination::WrapAroundPara>,
+    /// [Task #604 R3] 현재 단의 wrap text 문단 ↔ anchor 메타데이터.
+    /// wrap_around state machine 매칭 시 등록. flush_column 에서 ColumnContent 로 전달.
+    current_column_wrap_anchors: std::collections::HashMap<usize, crate::renderer::pagination::WrapAnchorRef>,
+    /// [Task #702] 현재 zone 의 ColumnType (Normal/Distribute/Parallel).
+    /// process_multicolumn_break 에서 새 ColumnDef 매칭 시 갱신.
+    /// Distribute 다단의 짧은 컬럼 vpos-reset 검출 임계값 완화에 사용.
+    current_zone_column_type: ColumnType,
+    /// [Task #853] 현재 zone 의 "디자인 spacing"(px) — 1단 ColumnDef 의 `간격` 값.
+    /// 한컴은 1단 ColumnDef 의 `간격`(가로 단 간격이지만 1단이라 무의미)을 zone 진입
+    /// 세로 간격으로 쓴다(shortcut.hwp 1쪽 헤더 띠 = 10mm). zone 전환 시
+    /// (이전 zone 디자인 spacing /2) + (새 zone 디자인 spacing /2) 를 zone_y_offset 에
+    /// 더한다. 다단(2+) ColumnDef 의 `간격`은 가로 간격이므로 0 으로 둔다.
+    current_zone_design_spacing_px: f64,
+}
+
+/// [Task #853] ColumnDef 의 "디자인 spacing"(px): 1단이면 `간격`, 다단이면 0.
+fn column_def_design_spacing_px(cd: &ColumnDef, dpi: f64) -> f64 {
+    if cd.column_count.max(1) <= 1 {
+        hwpunit_to_px(cd.spacing as i32, dpi)
+    } else {
+        0.0
+    }
 }
 
 impl TypesetState {
@@ -150,6 +181,7 @@ impl TypesetState {
         section_index: usize,
         footnote_separator_overhead: f64,
         footnote_safety_margin: f64,
+        column_type: ColumnType,
     ) -> Self {
         Self {
             pages: Vec::new(),
@@ -172,10 +204,16 @@ impl TypesetState {
             hidden_empty_lines: 0,
             hidden_empty_page_idx: usize::MAX,
             hidden_empty_paras: std::collections::HashSet::new(),
+            endnotes: Vec::new(),
+            endnote_paragraphs: Vec::new(),
             wrap_around_cs: -1,
             wrap_around_sw: -1,
             wrap_around_table_para: 0,
+            wrap_around_any_seg: false,
             current_column_wrap_around_paras: Vec::new(),
+            current_column_wrap_anchors: std::collections::HashMap::new(),
+            current_zone_column_type: column_type,
+            current_zone_design_spacing_px: 0.0,
         }
     }
 
@@ -216,6 +254,7 @@ impl TypesetState {
             zone_y_offset: self.current_zone_y_offset,
             wrap_around_paras: std::mem::take(&mut self.current_column_wrap_around_paras),
             used_height: self.current_height,
+            wrap_anchors: std::mem::take(&mut self.current_column_wrap_anchors),
         };
         if let Some(page) = self.pages.last_mut() {
             page.column_contents.push(col_content);
@@ -233,6 +272,7 @@ impl TypesetState {
             zone_y_offset: self.current_zone_y_offset,
             wrap_around_paras: std::mem::take(&mut self.current_column_wrap_around_paras),
             used_height: self.current_height,
+            wrap_anchors: std::mem::take(&mut self.current_column_wrap_anchors),
         };
         if let Some(page) = self.pages.last_mut() {
             page.column_contents.push(col_content);
@@ -369,8 +409,10 @@ impl TypesetEngine {
         let mut st = TypesetState::new(
             layout, col_count, section_index,
             footnote_separator_overhead, footnote_safety_margin,
+            column_def.column_type,
         );
         st.hide_empty_line = hide_empty_line;
+        st.current_zone_design_spacing_px = column_def_design_spacing_px(column_def, self.dpi);
 
         // 머리말/꼬리말/쪽 번호/새 번호/감추기 컨트롤 수집
         let (hf_entries, page_number_pos, new_page_numbers, page_hides) =
@@ -380,14 +422,43 @@ impl TypesetEngine {
             // 표 컨트롤 감지
             let has_table = self.paragraph_has_table(para);
 
+            // [Task #702] 새 ColumnDef 검출. shortcut.hwp p2/p3 파일/미리보기/편집 등은
+            // [쪽나누기]+단정의:1단 (header) → [단나누기]+단정의:2단 (content) 패턴 사용.
+            // [다단나누기] 외에도 Page/Column break 의 ColumnDef 차이도 zone 재정의 신호로 인식.
+            let new_col_def_opt: Option<ColumnDef> = para.controls.iter().find_map(|c| {
+                if let Control::ColumnDef(cd) = c { Some(cd.clone()) } else { None }
+            });
+            let has_diff_col_def = new_col_def_opt.as_ref().map(|cd| {
+                cd.column_count.max(1) != st.col_count
+                    || cd.column_type != st.current_zone_column_type
+            }).unwrap_or(false);
+
             // 다단 나누기
             if para.column_type == ColumnBreakType::MultiColumn {
                 self.process_multicolumn_break(&mut st, para_idx, paragraphs, page_def);
             }
 
             // 단 나누기
-            if para.column_type == ColumnBreakType::Column && !st.current_items.is_empty() {
-                st.advance_column_or_new_page();
+            if para.column_type == ColumnBreakType::Column {
+                if has_diff_col_def {
+                    // [Task #702] 단나누기 + 새 ColumnDef = zone 재정의 (MultiColumn 등가 처리)
+                    self.process_multicolumn_break(&mut st, para_idx, paragraphs, page_def);
+                } else if !st.current_items.is_empty() {
+                    // [Task #846] 마지막 단에서 명시적 단나누기 → 새 페이지가 아니라 같은
+                    // col_count 로 같은 페이지에 새 단-밴드를 시작 (들어갈 공간이 있으면). ≈ #768.
+                    // [Task #849] 단, 이는 "배분"(Distribute) 단에서만. "일반"(Normal/신문형)
+                    // 단에서 마지막 단의 단나누기는 같은 페이지 새 밴드를 만들지 않는다 (기존 동작).
+                    // [Task #866] shortcut.hwp 3쪽 "<편집 화면 분할에서>" pi=94 회귀 수정.
+                    let is_last_column = st.current_column + 1 >= st.col_count;
+                    if is_last_column
+                        && st.col_count > 1
+                        && st.current_zone_column_type == ColumnType::Distribute
+                    {
+                        self.start_new_column_band(&mut st, para_idx, paragraphs);
+                    } else {
+                        st.advance_column_or_new_page();
+                    }
+                }
             }
 
             // 쪽 나누기
@@ -398,15 +469,33 @@ impl TypesetEngine {
 
             if (force_page_break || para_style_break) && !st.current_items.is_empty() {
                 st.force_new_page();
+                // [Task #702] 쪽나누기 + 새 ColumnDef = 새 페이지에서 col 정의 적용
+                if has_diff_col_def {
+                    if let Some(cd) = &new_col_def_opt {
+                        st.col_count = cd.column_count.max(1);
+                        let new_layout = PageLayoutInfo::from_page_def(page_def, cd, self.dpi);
+                        st.current_zone_layout = Some(new_layout.clone());
+                        st.layout = new_layout;
+                        st.current_zone_column_type = cd.column_type;
+                        // [Task #853] 새 페이지 첫 zone: 디자인 spacing /2 (위쪽 절반)만 추가.
+                        // (이전 zone 은 이전 페이지에 있었으므로 아래쪽 절반은 더하지 않음.)
+                        let new_ds = column_def_design_spacing_px(cd, self.dpi);
+                        st.current_zone_y_offset += new_ds / 2.0;
+                        st.current_zone_design_spacing_px = new_ds;
+                    }
+                }
             }
 
             // Task #321: 문단간 vpos-reset 기반 강제 분할
             // HWP LINE_SEG의 vertical_pos는 페이지 내 흐름 y 좌표.
             // 현재 문단 first_vpos=0이고 직전 문단이 같은 단에 있으며 last_vpos가 충분히 큰 경우,
             // HWP가 pi 경계에서 페이지/단 분할을 의도한 것 → 강제 분할.
-            // [Task #362] wrap-around zone 활성 중에는 vpos-reset 가드 무시.
-            // 외부 표 옆에 흡수되는 paragraph 들의 vpos 가 0 으로 reset 되어 가드가 잘못 발동.
-            if para_idx > 0 && !st.current_items.is_empty() && st.wrap_around_cs < 0 {
+            // [Task #362] wrap-around zone 활성 중에는 vpos-reset 가드 무시 (기존).
+            // [Task #724] vpos-reset trigger 발동 시 wrap_around 강제 종료 (신규):
+            // HWP5 변환본 case 에서 paragraph 442/443 wrap_around 매칭 후 후속 paragraph
+            // (예: 599) vpos=0 시점에도 wrap_around active 유지되어 페이지 분할 위반 →
+            // vpos-reset trigger 시 wrap_around 강제 종료 + advance_column_or_new_page.
+            if para_idx > 0 && !st.current_items.is_empty() {
                 let prev_para = &paragraphs[para_idx - 1];
                 let curr_first_vpos = para.line_segs.first().map(|s| s.vertical_pos);
                 let prev_last_vpos = prev_para.line_segs.last().map(|s| s.vertical_pos);
@@ -415,15 +504,41 @@ impl TypesetEngine {
                     // - 단일 단: cv == 0 만 인정 (Task #321 보수적 기준 유지).
                     //   단일 단에서 cv != 0 의 cv < pv 는 partial-table split 의 LAYOUT 잔재로
                     //   해석되어야 함 (issue #418 / hwpspec pi=78→pi=79).
-                    // - 다단: cv != 0 도 인정 (Task #470). 컬럼 헤더 오프셋 (cv=9014 등) 으로
-                    //   시작하는 새 컬럼의 reset 을 감지.
+                    // - 다단 Normal (NEWSPAPER): cv != 0 도 인정 (Task #470). pv > 5000 임계값 유지.
+                    // - 다단 Distribute (BalancedNewspaper): 짧은 컬럼 (3+3 분배 등) 에서 pv 가
+                    //   임계값 미달일 수 있어 pv > 0 으로 완화 (Task #702, shortcut 지우기 6항목 정합).
+                    //   단일 단/Normal 다단은 영향 없음.
+                    let is_distribute = st.col_count > 1
+                        && matches!(st.current_zone_column_type, ColumnType::Distribute);
+                    // [Task #853] Distribute 다단의 "1줄짜리 컬럼" 케이스: 직전 문단이
+                    // 단 1줄(예: vpos=0)이고 현재 문단도 vpos=0 이면 `cv < pv` 가 0<0 으로
+                    // 거짓이라 컬럼 전환을 못 잡았다(shortcut.hwp 스타일/속성 섹션). 직전 문단의
+                    // vpos+line_height(=콘텐츠 끝)를 기준으로 비교하면 정상 흐름(cv=pv_end+ls≥pv_end)
+                    // 은 영향 없고 reset(cv≪pv_end)만 잡힌다.
+                    let prev_vpos_end = prev_para.line_segs.last()
+                        .map(|s| s.vertical_pos + s.line_height)
+                        .unwrap_or(pv);
                     let trigger = if st.col_count > 1 {
-                        cv < pv && pv > 5000
+                        if is_distribute {
+                            cv < prev_vpos_end && prev_vpos_end > 0
+                        } else {
+                            cv < pv && pv > 5000
+                        }
                     } else {
                         cv == 0 && pv > 5000
                     };
                     if trigger {
-                        st.advance_column_or_new_page();
+                        // [Task #724] wrap_around active 시 강제 종료 — anchor cs=0
+                        // (HWP5 변환본 caption-style) 한정. 일반 wrap_around (anchor cs>0)
+                        // 는 기존 동작 (Task #362 vpos-reset 무시) 유지.
+                        if st.wrap_around_cs == 0 {
+                            st.wrap_around_cs = -1;
+                            st.wrap_around_sw = -1;
+                            st.wrap_around_any_seg = false;
+                        }
+                        if st.wrap_around_cs < 0 {
+                            st.advance_column_or_new_page();
+                        }
                     }
                 }
             }
@@ -466,6 +581,34 @@ impl TypesetEngine {
                     // 일반 텍스트 또는 컨트롤 보유: 안전마진 1회 비활성화 (단독 텍스트 페이지 차단)
                     st.skip_safety_margin_once = true;
                 }
+            } else if !st.current_items.is_empty() && para_idx + 1 < paragraphs.len() {
+                // [Task #967] 빈 paragraph 직후 force page break (쪽나누기) case 가드:
+                // 빈 paragraph 가 현재 page 잔여 공간 초과 시 별도 page 분기 →
+                // +1 page inflate 회귀 (sample18.hwp 의 pi=27, pi=164).
+                // 한컴은 빈 paragraph 를 trailing overflow 로 흡수 + 쪽나누기로 새 page 시작.
+                // next_will_vpos_reset 가드는 next_force_break 인 경우 발동 안 함
+                // (hwp-multi-001 회귀 차단). 본 추가 가드는 빈 paragraph + 다음 쪽나누기
+                // case 중에서 **현재 page 잔여 공간 부족 (overflow) 시에만** skip — 빈
+                // paragraph 가 page 에 fit 하면 정상 emit (aift.hwp 의 18 case 회귀 방지).
+                let next_para = &paragraphs[para_idx + 1];
+                let next_force_break = next_para.column_type == ColumnBreakType::Page
+                    || next_para.column_type == ColumnBreakType::Section;
+                let is_curr_empty = para.text.is_empty() && para.controls.is_empty();
+                if next_force_break && is_curr_empty {
+                    // empty paragraph 의 예상 height = first line_seg 의 lh + ls
+                    let empty_h_px = para.line_segs.first().map(|s| {
+                        hwpunit_to_px(
+                            (s.line_height + s.line_spacing) as i32,
+                            self.dpi,
+                        )
+                    }).unwrap_or(0.0);
+                    let avail = st.available_height() - st.current_height;
+                    if empty_h_px > avail {
+                        // 빈 paragraph 가 fit 안 됨 → skip 으로 단독 page 차단
+                        continue;
+                    }
+                    // fit 가능 — 정상 emit (기존 동작)
+                }
             }
             // [Task #362] 어울림(Square wrap) 표 옆 paragraph 흡수.
             // Paginator engine.rs:288-320 동일 시멘틱.
@@ -482,22 +625,141 @@ impl TypesetEngine {
                 let body_w = (page_def.width as i32) - (page_def.margin_left as i32) - (page_def.margin_right as i32);
                 let sw0_match = st.wrap_around_sw == 0 && is_empty_para && para_sw > 0
                     && para_sw < body_w / 2;
+                // [Task #724] HWP5 변환본 case: anchor host 의 wrap=Square image 위치/폭/margin
+                // 으로 expected_cs 정확 계산 후 para_cs 일치 확인. anchor cs=0 (caption-style)
+                // 한정 가드. expected_cs = (image_x_offset + width + 2*margin) - body_left.
+                let anchor_image_match = if st.wrap_around_cs == 0 {
+                    let body_left = page_def.margin_left as i32;
+                    let expected_cs_hu = paragraphs.get(st.wrap_around_table_para)
+                        .and_then(|p| p.controls.iter().find_map(|c| {
+                            let cm = match c {
+                                Control::Picture(pic) => Some(&pic.common),
+                                Control::Shape(s) => if let crate::model::shape::ShapeObject::Picture(pic) = s.as_ref() {
+                                    Some(&pic.common)
+                                } else { None },
+                                _ => None,
+                            };
+                            cm.filter(|cm| !cm.treat_as_char
+                                && matches!(cm.text_wrap, crate::model::shape::TextWrap::Square))
+                                .map(|cm| cm.horizontal_offset as i32 + cm.width as i32
+                                    + 2 * cm.margin.right as i32 - body_left)
+                        }))
+                        .unwrap_or(0);
+                    expected_cs_hu > 0
+                        && (para_cs - expected_cs_hu).abs() < 200
+                        && para_sw > 0
+                        && para_cs + para_sw <= body_w + 200
+                } else { false };
+                // [Task #901] cs 일치 + 합리적 sw 매칭 (anchor 의 wrap zone region 다양성).
+                // pic2.hwp paragraph 1 (cs=24470 sw=18050) vs anchor (wrap_around_cs=24470 sw=2570)
+                // — cs 같지만 sw 다름 (다른 wrap region). 기존 매칭 실패 → wrap_anchors 미등록
+                // → paragraph 좌측 그려짐. anchor_any_seg 가 활성이면 cs 정확 일치 만으로
+                // wrap zone 내부 paragraph 로 인정.
+                let cs_only_match = st.wrap_around_any_seg
+                    && para_cs == st.wrap_around_cs
+                    && para_sw > 0;
                 if (para_cs == st.wrap_around_cs && para_sw == st.wrap_around_sw)
-                    || (any_seg_matches && is_empty_para)
-                    || sw0_match {
-                    // 어울림 문단: 표 옆에 기록 + height 소비 없음
-                    st.current_column_wrap_around_paras.push(
-                        crate::renderer::pagination::WrapAroundPara {
-                            para_index: para_idx,
-                            table_para_index: st.wrap_around_table_para,
-                            has_text: !is_empty_para,
+                    || (any_seg_matches && (is_empty_para || st.wrap_around_any_seg))
+                    || sw0_match
+                    || anchor_image_match
+                    || cs_only_match {
+                    // [Task #604 R3] wrap_around 매칭 분기를 anchor 종류 기반으로 본질화.
+                    //
+                    // - Picture (그림 Square wrap) anchor: wrap text 가 LineSeg cs/sw 로
+                    //   사전 인코딩됨 → wrap_anchors 등록 + FullParagraph 통과
+                    //   (layout 이 LineSeg cs/sw 정합 렌더)
+                    // - Table (표 Square wrap) anchor: wrap text 는 표 옆 빈 ↵ 표시용
+                    //   → 흡수 (current_column_wrap_around_paras)
+                    //
+                    // Stage 2b: Paragraph.wrap_precomputed (HWP3 휴리스틱 IR 누설) 제거.
+                    // anchor paragraph 의 controls 검사로 본질 정합 대체.
+                    let anchor_is_picture = paragraphs.get(st.wrap_around_table_para)
+                        .map(|p| p.controls.iter().any(|c| match c {
+                            Control::Picture(pic) => !pic.common.treat_as_char,
+                            Control::Shape(s) => {
+                                if let crate::model::shape::ShapeObject::Picture(pic) = s.as_ref() {
+                                    !pic.common.treat_as_char
+                                } else { false }
+                            }
+                            _ => false,
+                        }))
+                        .unwrap_or(false);
+                    if anchor_is_picture {
+                        // Picture anchor: wrap_anchors 등록 + FullParagraph 통과
+                        // [Task #722] anchor image 의 outer margin_right (HU) 추출
+                        let anchor_margin_right = paragraphs.get(st.wrap_around_table_para)
+                            .and_then(|p| p.controls.iter().find_map(|c| {
+                                let cm = match c {
+                                    Control::Picture(pic) => Some(&pic.common),
+                                    Control::Shape(s) => if let crate::model::shape::ShapeObject::Picture(pic) = s.as_ref() {
+                                        Some(&pic.common)
+                                    } else { None },
+                                    _ => None,
+                                };
+                                cm.filter(|cm| !cm.treat_as_char
+                                    && matches!(cm.text_wrap, crate::model::shape::TextWrap::Square))
+                                    .map(|cm| cm.margin.right as i32)
+                            })).unwrap_or(0);
+                        st.current_column_wrap_anchors.insert(
+                            para_idx,
+                            crate::renderer::pagination::WrapAnchorRef {
+                                anchor_para_index: st.wrap_around_table_para,
+                                anchor_cs: st.wrap_around_cs,
+                                anchor_sw: st.wrap_around_sw,
+                                anchor_image_margin_right: anchor_margin_right,
+                            },
+                        );
+                    } else {
+                        // Table anchor: 어울림 문단을 표 옆에 기록 + height 소비 없음.
+                        // [Task #855] 단, 첫 줄만 표 옆이고 나머지 줄이 본문 전체 폭으로
+                        // 흐르는 문단(= 마지막 LINE_SEG 가 wrap zone cs/sw 와 불일치)은
+                        // 0-높이 흡수 대상이 아니다. 첫 LINE_SEG 만 보고 흡수하면 그런 문단이
+                        // 통째로 페이지 흐름에서 누락된다. 이 경우 wrap zone 을 종료하고
+                        // 일반 텍스트 배치로 폴백한다 (LINE_SEG cs/sw 가 이미 wrap 형상을
+                        // 인코딩하므로 layout 이 첫 줄을 표 옆에, 나머지를 표 아래에 렌더).
+                        let last_seg_match = para.line_segs.last().map(|s|
+                            s.column_start == st.wrap_around_cs && s.segment_width as i32 == st.wrap_around_sw
+                        ).unwrap_or(false);
+                        if last_seg_match || is_empty_para {
+                            st.current_column_wrap_around_paras.push(
+                                crate::renderer::pagination::WrapAroundPara {
+                                    para_index: para_idx,
+                                    table_para_index: st.wrap_around_table_para,
+                                    has_text: !is_empty_para,
+                                }
+                            );
+                            continue;
                         }
-                    );
-                    continue;
+                        st.wrap_around_cs = -1;
+                        st.wrap_around_sw = -1;
+                        st.wrap_around_any_seg = false;
+                        // fall through → 일반 paragraph 배치
+                    }
                 } else {
                     // 매칭 실패 → wrap zone 종료, 정상 처리 진행
                     st.wrap_around_cs = -1;
                     st.wrap_around_sw = -1;
+                    st.wrap_around_any_seg = false;
+                    // [Task #741 Stage 4] 매칭 실패 paragraph 의 vpos=0 hint (page break 의도)
+                    // 발견 시 advance_column_or_new_page. wrap_around active 종료 후 추가 가드.
+                    // hwp3-sample10-hwp5.hwp paragraph 26 ("● 제목차례 ●") case —
+                    // paragraph 22 anchor (cs=11084) active 유지로 line 419 vpos-reset 가드
+                    // 미발현 → 매칭 실패 후 추가 vpos-reset 가드로 페이지 break 정합.
+                    if para_idx > 0 && !st.current_items.is_empty() {
+                        let prev_para = &paragraphs[para_idx - 1];
+                        let curr_first_vpos = para.line_segs.first().map(|s| s.vertical_pos);
+                        let prev_last_vpos = prev_para.line_segs.last().map(|s| s.vertical_pos);
+                        if let (Some(cv), Some(pv)) = (curr_first_vpos, prev_last_vpos) {
+                            let trigger = if st.col_count > 1 {
+                                cv < pv && pv > 5000
+                            } else {
+                                cv == 0 && pv > 5000
+                            };
+                            if trigger {
+                                st.advance_column_or_new_page();
+                            }
+                        }
+                    }
                 }
             }
 
@@ -551,7 +813,15 @@ impl TypesetEngine {
                         })
                         .sum();
                     let para_h_hu = crate::renderer::px_to_hwpunit(para_h_px, self.dpi);
-                    let vpos_end = first_seg.vertical_pos + para_h_hu;
+                    // [Task #643] vpos_end 는 마지막 줄의 bottom (vpos + lh) 기준.
+                    // para_h_px 누적은 트레일링 line_spacing 까지 포함하여 ~10-12 HU 과대.
+                    // HWP 가 페이지 끝에서 트레일링 ls 를 고려하지 않고 lh 만 fit 검사하는
+                    // 시멘틱 정합 (pi=39 page 3 fits 케이스).
+                    let vpos_end = para
+                        .line_segs
+                        .last()
+                        .map(|s| s.vertical_pos + s.line_height)
+                        .unwrap_or(first_seg.vertical_pos + para_h_hu);
                     let page_bottom_vpos = page_top_vpos + body_h_hu;
 
                     let avail = st.available_height();
@@ -585,7 +855,8 @@ impl TypesetEngine {
             if !has_table {
                 // --- 핵심: format → fits → place/split ---
                 let formatted = self.format_paragraph(para, composed.get(para_idx), styles);
-                self.typeset_paragraph(&mut st, para_idx, para, &formatted);
+                let is_last_in_section = para_idx + 1 == paragraphs.len();
+                self.typeset_paragraph(&mut st, para_idx, para, &formatted, is_last_in_section);
             } else {
                 // 표 문단: Phase 2에서 전환 예정. 현재는 기존 방식 호환용 stub.
                 self.typeset_table_paragraph(
@@ -616,6 +887,78 @@ impl TypesetEngine {
                             .map(|s| s.segment_width as i32)
                             .unwrap_or(0);
                         st.wrap_around_table_para = para_idx;
+                        st.wrap_around_any_seg = false;
+                    }
+                }
+            }
+            // 비-TAC Picture/Shape Square wrap: engine.rs:380-397 동일 시멘틱.
+            // 그림의 첫 lineseg cs가 0일 수 있어 any_seg_matches 허용 플래그 활성화.
+            if !has_table {
+                let has_non_tac_pic_square = para.controls.iter().any(|c| {
+                    let cm = match c {
+                        Control::Picture(p) => Some(&p.common),
+                        Control::Shape(s) => if let crate::model::shape::ShapeObject::Picture(p) = s.as_ref() { Some(&p.common) } else { None },
+                        _ => None,
+                    };
+                    cm.map(|cm| !cm.treat_as_char && matches!(cm.text_wrap, crate::model::shape::TextWrap::Square)).unwrap_or(false)
+                });
+                if has_non_tac_pic_square {
+                    let anchor_cs = para.line_segs.first().map(|s| s.column_start).unwrap_or(0);
+                    let anchor_sw = para.line_segs.first().map(|s| s.segment_width as i32).unwrap_or(0);
+                    if anchor_cs > 0 || anchor_sw > 0 {
+                        st.wrap_around_cs = anchor_cs;
+                        st.wrap_around_sw = anchor_sw;
+                        st.wrap_around_table_para = para_idx;
+                        st.wrap_around_any_seg = true;
+                        // [Task #722] anchor host paragraph 자체도 wrap_anchors 등록.
+                        // LINE_SEG cs/sw 가 wrap zone 으로 인코딩되어 있으면 host paragraph 의
+                        // 줄도 image 우측 wrap zone 에 layout 되어야 한다 (한컴 PDF 권위 정합).
+                        // 미등록 시 paragraph_layout 의 wrap_anchor 분기 미진입 → col_area
+                        // 전체 폭 layout → image 영역 침범 → image z-order 후 그려져 가려짐.
+                        //
+                        // Case 가드 (Stage 3~5 진단):
+                        //   - LINE_SEG ≥ 2 → wrap zone (multi-line)
+                        //   - LINE_SEG 1 + caption_room ≤ line_height → wrap zone (image 가
+                        //     body_top 자체에 위치 → image 위 caption 영역 없음, 강제 wrap)
+                        //   - LINE_SEG 1 + caption_room > line_height → caption-style (자기
+                        //     미등록 → col_area 전체 폭 layout, image 위 자유 영역 표시)
+                        let body_top_hu = page_def.margin_top as i32;
+                        let line_height_hu = para.line_segs.first()
+                            .map(|s| s.line_height as i32).unwrap_or(900);
+                        let (image_voff_hu, image_margin_right_hu) = para.controls.iter().find_map(|c| {
+                            let cm = match c {
+                                Control::Picture(p) => Some(&p.common),
+                                Control::Shape(s) => if let crate::model::shape::ShapeObject::Picture(p) = s.as_ref() {
+                                    Some(&p.common)
+                                } else { None },
+                                _ => None,
+                            };
+                            cm.filter(|cm| !cm.treat_as_char
+                                && matches!(cm.text_wrap, crate::model::shape::TextWrap::Square))
+                                .map(|cm| (cm.vertical_offset as i32, cm.margin.right as i32))
+                        }).unwrap_or((0, 0));
+                        let caption_room_hu = image_voff_hu - body_top_hu;
+                        let is_caption_style = para.line_segs.len() == 1
+                            && caption_room_hu > line_height_hu;
+                        // [PR #732 후속 — exam_science 회귀 가드] image_mr=0 (margin 부재) 이면
+                        // 본 환경 OLD 동작 보존 — Task #722 host_self register skip.
+                        // 본질: image_mr > 0 인 경우 (한컴 viewer 가 inter-image-text gap 으로
+                        // margin 적용) 만 host_self register 가 의미. exam_science p.21/37/60 의
+                        // Square wrap picture 는 image_mr=0 (호스트 margin 부재) 이므로 OLD 의
+                        // col_area-full-width layout 정합 (line_seg cs=0/sw=실제 wrap zone 인코딩
+                        // 으로 한컴 정합 이미 유지). hwp3-sample5.hwp 의 page 8/27/48 (Task #722
+                        // 본질 영역) 은 image_mr > 0 으로 가드 통과 → 정합 유지.
+                        if !is_caption_style && image_margin_right_hu > 0 {
+                            st.current_column_wrap_anchors.insert(
+                                para_idx,
+                                crate::renderer::pagination::WrapAnchorRef {
+                                    anchor_para_index: para_idx,
+                                    anchor_cs,
+                                    anchor_sw,
+                                    anchor_image_margin_right: image_margin_right_hu,
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -718,7 +1061,74 @@ impl TypesetEngine {
                             st.add_footnote_height(fn_height);
                         }
                     }
+                    Control::Endnote(en_ctrl) => {
+                        // [Task #836] 미주 수집 — 문서 끝에 모아서 렌더
+                        st.endnotes.push(EndnoteRef {
+                            number: en_ctrl.number,
+                            section_index,
+                            para_index: para_idx,
+                            control_index: ctrl_idx,
+                        });
+                    }
                     _ => {}
+                }
+            }
+        }
+
+        // [Task #836] 미주 paragraphs를 본문 흐름에 가상 삽입
+        // 한컴 정합: 미주는 섹션 마지막에 일반 본문처럼 2단 레이아웃 플로우를 따름
+        // 미주 paragraphs를 endnote_paragraphs Vec에 모으고, ENDNOTE_PARA_BASE 이상 인덱스로 마킹
+        if !st.endnotes.is_empty() {
+            let endnote_refs: Vec<EndnoteRef> = st.endnotes.clone();
+            // 본문 마지막 paragraph의 vpos 끝 위치 계산
+            let mut vpos_offset: i32 = paragraphs.last()
+                .and_then(|p| p.line_segs.last())
+                .map(|ls| ls.vertical_pos + ls.line_height + ls.line_spacing)
+                .unwrap_or(0);
+
+            for en_ref in &endnote_refs {
+                if let Some(para) = paragraphs.get(en_ref.para_index) {
+                    if let Some(Control::Endnote(en_ctrl)) = para.controls.get(en_ref.control_index) {
+                        // endnote 단위로 시작점 결정
+                        let endnote_start = vpos_offset;
+                        for (ep_idx, en_para) in en_ctrl.paragraphs.iter().enumerate() {
+                            let en_para_idx = paragraphs.len() + st.endnote_paragraphs.len();
+                            let mut en_para_copy = en_para.clone();
+                            // line_segs vpos를 endnote 시작점 기준으로 오프셋
+                            for ls in &mut en_para_copy.line_segs {
+                                ls.vertical_pos += endnote_start;
+                            }
+                            // 첫 paragraph에 미주 번호 prepend ("문N) ")
+                            if ep_idx == 0 {
+                                let prefix = format!("문{}) ", en_ref.number);
+                                en_para_copy.text = format!("{}{}", prefix, en_para_copy.text);
+                                en_para_copy.char_count += prefix.encode_utf16().count() as u32;
+                                let shift = prefix.encode_utf16().count() as u32;
+                                for off in &mut en_para_copy.char_offsets {
+                                    *off += shift;
+                                }
+                                let mut new_offsets: Vec<u32> = (0..shift).collect();
+                                new_offsets.extend_from_slice(&en_para_copy.char_offsets);
+                                en_para_copy.char_offsets = new_offsets;
+                            }
+                            // endnote 끝 위치 추적
+                            if let Some(last_ls) = en_para.line_segs.last() {
+                                let end = endnote_start + last_ls.vertical_pos + last_ls.line_height + last_ls.line_spacing;
+                                if end > vpos_offset { vpos_offset = end; }
+                            }
+                            st.endnote_paragraphs.push(en_para_copy);
+
+                            let composed = crate::renderer::composer::compose_paragraph(en_para);
+                            let fmt = self.format_paragraph(en_para, Some(&composed), &styles);
+                            let available = st.available_height();
+
+                            if st.current_height + fmt.height_for_fit > available && !st.current_items.is_empty() {
+                                st.advance_column_or_new_page();
+                            }
+                            st.current_items.push(PageItem::FullParagraph { para_index: en_para_idx });
+                            st.current_height += if st.col_count > 1 { fmt.height_for_fit } else { fmt.total_height };
+                        }
+                    }
                 }
             }
         }
@@ -735,7 +1145,7 @@ impl TypesetEngine {
             &new_page_numbers, &page_hides, section_index,
         );
 
-        PaginationResult { pages: st.pages, wrap_around_paras: Vec::new(), hidden_empty_paras: st.hidden_empty_paras }
+        PaginationResult { pages: st.pages, wrap_around_paras: Vec::new(), hidden_empty_paras: st.hidden_empty_paras, endnotes: st.endnotes, endnote_paragraphs: st.endnote_paragraphs }
     }
 
     // ========================================================
@@ -754,14 +1164,36 @@ impl TypesetEngine {
         let para_style = styles.para_styles.get(para_style_id);
         let spacing_before = para_style.map(|s| s.spacing_before).unwrap_or(0.0);
         let spacing_after = para_style.map(|s| s.spacing_after).unwrap_or(0.0);
+        // [Task #874 Case 3] `<...>` 단독 paragraph 의 paragraph-level extra spacing 제거.
+        // 이전 #866 Stage 2 는 paragraph 위·아래 각 +20px (총 +40px) 을 paragraph 자체 height
+        // 에 포함시켰으나, typeset 의 zone 전환 패딩(solo_zone_pad +16px enter +16px leave)
+        // 이 이미 동일 역할을 담당하므로 이중 패딩이 발생 (한컴 PDF 대비 +48px excess, 4·5쪽
+        // 누적 +17~30pt 사용자 피드백). zone 전환 패딩만 유지.
 
         let ls_val = para_style.map(|s| s.line_spacing).unwrap_or(160.0);
         let ls_type = para_style.map(|s| s.line_spacing_type)
             .unwrap_or(crate::model::style::LineSpacingType::Percent);
 
+        // [Task #901 Stage 7] wrap zone host paragraph 의 whitespace-only line 은 height 제외.
+        // paragraph_layout 의 skip_advance_empty_wrap 와 정합 — pagination 의 height 계산
+        // 이 시각 렌더링과 어긋나 paragraph 11 등이 잘못 다음 페이지로 분할되는 문제 해소.
+        let has_picture_shape_square_wrap = para.controls.iter().any(|c| {
+            use crate::model::shape::TextWrap;
+            let common_opt = match c {
+                Control::Picture(pic) if !pic.common.treat_as_char => Some(&pic.common),
+                Control::Shape(s) if !s.common().treat_as_char => Some(s.common()),
+                _ => None,
+            };
+            common_opt.map(|cm| matches!(cm.text_wrap, TextWrap::Square)).unwrap_or(false)
+        });
+
         let (line_heights, line_spacings): (Vec<f64>, Vec<f64>) = if let Some(comp) = composed {
             comp.lines.iter()
                 .map(|line| {
+                    let runs_all_whitespace = line.runs.iter().all(|r| r.text.trim().is_empty());
+                    if has_picture_shape_square_wrap && runs_all_whitespace {
+                        return (0.0, 0.0);
+                    }
                     let raw_lh = hwpunit_to_px(line.line_height, self.dpi);
                     let max_fs = line.runs.iter()
                         .map(|r| {
@@ -827,6 +1259,7 @@ impl TypesetEngine {
         para_idx: usize,
         para: &Paragraph,
         fmt: &FormattedParagraph,
+        is_last_in_section: bool,
     ) {
         // Task #332 Stage 4a: layout drift 안전 마진.
         // typeset 의 fit 추정과 layout 의 실측 진행은 폰트 메트릭/표 측정 다중성 등으로
@@ -838,7 +1271,9 @@ impl TypesetEngine {
         // PartialTable 의 cur_h 는 row 단위로 정확히 누적되므로 안전마진이 과함.
         // (k-water-rfp p15 case: PartialTable 직후 작은 텍스트 (16px) 가 잔여 5.3px 부족으로
         // fit 실패하여 다음 페이지로 밀리는 회귀.)
-        const LAYOUT_DRIFT_SAFETY_PX: f64 = 10.0;
+        // [Task #643] VPOS_CORR 백워드 허용 (8px) 으로 layout drift 누적이 해소됨.
+        // 트레일링 ls 누적 fit 산식 정정과 함께 안전마진 10 → 4 축소.
+        const LAYOUT_DRIFT_SAFETY_PX: f64 = 4.0;
         let prev_is_partial_table = matches!(
             st.current_items.last(),
             Some(PageItem::PartialTable { .. })
@@ -933,6 +1368,29 @@ impl TypesetEngine {
                     para_index: para_idx,
                 });
                 return;
+            }
+        }
+
+        // [Task #676] trailing empty paragraph 가드 (단단 전용):
+        // 섹션 마지막 빈 paragraph 가 LAYOUT_DRIFT_SAFETY_PX(10px) 영역 내 미세 overflow 로
+        // fit 실패 시 height=0 흡수 — 단독 빈 페이지 차단. 한컴2022 정합 시멘틱.
+        // (통합재정통계 2010.11/2011.10: pi=14 cur_h=751.0 + 16.0 = 767.0 > avail 766.2,
+        //  overflow=0.8px ≤ safety_margin 10px → 흡수.)
+        // hide_empty_line (Task #362) 분기와 달리 SectionDef bit 무관, 섹션 마지막 1개만 흡수.
+        if is_last_in_section
+            && st.col_count == 1
+            && !st.current_items.is_empty()
+        {
+            let trimmed = para.text.replace(|c: char| c.is_control(), "");
+            let is_empty_para = trimmed.trim().is_empty() && para.controls.is_empty();
+            if is_empty_para {
+                let total_h = st.current_height + fmt.height_for_fit;
+                let fit_fail_within_safety =
+                    total_h > available && total_h <= available + LAYOUT_DRIFT_SAFETY_PX;
+                if fit_fail_within_safety {
+                    st.current_items.push(PageItem::FullParagraph { para_index: para_idx });
+                    return;
+                }
             }
         }
 
@@ -1044,9 +1502,36 @@ impl TypesetEngine {
             let mut cumulative = 0.0;
             let mut end_line = cursor_line;
             for li in cursor_line..line_count {
+                // [Task #619] 다단 paragraph 내 vpos-reset 강제 분리.
+                // line_segs[li].vertical_pos == 0 (li>0) 은 HWP 가 해당 line 을
+                // 다음 단/페이지 최상단에 배치하도록 인코딩한 신호.
+                // 다단 한정 적용 — 단일 단은 partial-table split 회귀 (issue #418) 차단 위해 미적용.
+                if st.col_count > 1
+                    && li > cursor_line
+                    && para.line_segs.get(li).map(|s| s.vertical_pos == 0).unwrap_or(false)
+                {
+                    break;
+                }
                 let content_h = fmt.line_heights[li];
                 if cumulative + content_h > avail_for_lines && li > cursor_line {
-                    break;
+                    // [Task #631] HWP 권위값 더블체크
+                    // 누적 추정으로는 fit 실패하지만 HWP 파일 자체가 다음 줄(li+1)에
+                    // vpos-reset(=0) 을 인코딩한 경우, 한컴 엔진이 직접 li 까지를 현재
+                    // 페이지에 배치한 것이다. typeset 보수 마진(20px) 으로 인한 콘텐츠
+                    // 손실을 차단하기 위해 HWP 신호를 우선한다.
+                    // 조건: (1) 다음 줄의 vpos==0 (페이지 경계 신호)
+                    //       (2) 현재 줄의 hwp 좌표 vpos+lh 가 body_available 안
+                    let hwp_authoritative = para.line_segs.get(li + 1)
+                        .map(|next| next.vertical_pos == 0)
+                        .unwrap_or(false)
+                        && para.line_segs.get(li).map(|cur| {
+                            let bottom_px = crate::renderer::hwpunit_to_px(
+                                cur.vertical_pos + cur.line_height, self.dpi);
+                            bottom_px <= st.base_available_height()
+                        }).unwrap_or(false);
+                    if !hwp_authoritative {
+                        break;
+                    }
                 }
                 cumulative += fmt.line_advance(li);
                 end_line = li + 1;
@@ -1158,7 +1643,20 @@ impl TypesetEngine {
         };
 
         // 비-TAC 표: 호스트 문단의 trailing line_spacing도 포함
-        let host_line_spacing = if !is_tac {
+        // [Task #874 #7] 비-TAC 1×1 placeholder 표 (paras=1 text-only) 는 host
+        // line_spacing 을 더하지 않는다. 한컴은 표 outer_margin_bottom 만 사용 (호스트
+        // 문단 line_spacing 은 본문 라인 간 간격 의미). aift.hwp p21 표 pi=268
+        // ("협업 시스템 구성도 이미지") 직후 pi=284 ("코멘트 스레드 관리...") 가
+        // 9.6 px 만큼 다음 페이지로 밀려나는 문제 해결.
+        let is_single_cell_placeholder = !is_tac
+            && table.row_count == 1
+            && table.col_count == 1
+            && table.cells.len() == 1
+            && table.cells.first()
+                .map(|c| c.paragraphs.iter().all(|p|
+                    p.controls.is_empty() && p.line_segs.len() <= 1))
+                .unwrap_or(false);
+        let host_line_spacing = if !is_tac && !is_single_cell_placeholder {
             para.line_segs.last()
                 .filter(|seg| seg.line_spacing > 0)
                 .map(|seg| hwpunit_to_px(seg.line_spacing, self.dpi))
@@ -1274,6 +1772,25 @@ impl TypesetEngine {
         for (ctrl_idx, ctrl) in para.controls.iter().enumerate() {
             match ctrl {
                 Control::Table(table) => {
+                    // [Issue #703] 글앞으로 / 글뒤로 표는 Shape처럼 취급 — 본문 흐름 공간 차지 없음.
+                    // pagination/engine.rs:976-981 와 동일 시멘틱: 데코레이션 표는 절대 좌표로 배치되며
+                    // current_height 누적에 영향을 주지 않는다.
+                    //
+                    // [Issue #775] 단일 컬럼 한정. 다단(col_count>=2) 영역에서는 InFrontOfText/BehindText
+                    // 표라도 cur_h 누적이 컬럼 분배에 필요 (exam_eng.hwp p4 27번 보기 그림 위
+                    // 데코레이션 표 회귀 차단).
+                    if matches!(
+                        table.common.text_wrap,
+                        crate::model::shape::TextWrap::InFrontOfText
+                            | crate::model::shape::TextWrap::BehindText
+                    ) && st.col_count == 1
+                    {
+                        st.current_items.push(PageItem::Shape {
+                            para_index: para_idx,
+                            control_index: ctrl_idx,
+                        });
+                        continue;
+                    }
                     let is_column_top = st.current_height < 1.0;
                     let ft = self.format_table(
                         para, para_idx, ctrl_idx, table,
@@ -1456,6 +1973,23 @@ impl TypesetEngine {
         let total_lines = fmt.line_heights.len();
         let pre_table_end_line = if vertical_offset > 0 && !para.text.is_empty() {
             total_lines
+        } else if table.common.treat_as_char && total_lines > 1
+            && para.text.chars().any(|c| c.is_alphanumeric())
+        {
+            // 전폭 TAC 표가 자동 줄바꿈으로 자기 줄(line index N)에 놓인 경우(\n 없음):
+            // 한컴은 LINE_SEG 순서대로 line0=텍스트 → lineN=표 로 렌더한다.
+            // control_text_positions() 는 char_offsets 가 비면 무용하므로, 표 줄의 높이
+            // (표 본체 + outer margin top/bottom)와 일치하는 LINE_SEG 인덱스로 판정한다.
+            // PUA 필러/공백만 있는 문단(예: 복학원서.hwp pi=16 — 한컴이 표 폭만큼 필러로
+            // 줄바꿈시킨 케이스)은 is_alphanumeric() 가 false 라 제외 → compute_tac_leading
+            // 경로 유지. (Task #853, Task #842 결함 #2 의 PUA 필러 판정과 정합)
+            let om_top = hwpunit_to_px(table.outer_margin_top as i32, self.dpi);
+            let om_bot = hwpunit_to_px(table.outer_margin_bottom as i32, self.dpi);
+            let tbl_line_h = hwpunit_to_px(table.common.height as i32, self.dpi) + om_top + om_bot;
+            para.line_segs.iter().enumerate()
+                .find(|(_, ls)| (hwpunit_to_px(ls.line_height, self.dpi) - tbl_line_h).abs() < 1.0)
+                .map(|(i, _)| i)
+                .unwrap_or(0)
         } else {
             0
         };
@@ -1492,10 +2026,19 @@ impl TypesetEngine {
         // - Square wrap (어울림): max(pre_height, v_off + table_total)
         //     호스트 텍스트와 표가 같은 y 영역을 공유하므로 더 큰 쪽만 누적.
         // - 그 외 (TopAndBottom 등): pre_height + table_total 합산 (기존 동작).
+        // 전폭 TAC 표가 자기 줄(line index = pre_table_end_line)에 놓인 split 케이스:
+        // table_total_height(=fmt.height_for_fit)는 pre-text 줄까지 포함하므로 pre_height
+        // 를 따로 더하면 이중 계산이 된다. 또 표가 차지한 줄은 post-text 에서 제외해야 한다.
+        // (Task #853)
+        let tac_wrap_split = table.common.treat_as_char
+            && pre_table_end_line > 0 && pre_table_end_line < total_lines;
+
         if is_wrap_around_table && pre_height > 0.0 {
             let v_off_px = crate::renderer::hwpunit_to_px(vertical_offset as i32, self.dpi);
             let table_bottom = v_off_px + table_total_height;
             st.current_height += pre_height.max(table_bottom);
+        } else if tac_wrap_split {
+            st.current_height += table_total_height;
         } else {
             st.current_height += pre_height + table_total_height;
         }
@@ -1506,7 +2049,9 @@ impl TypesetEngine {
         let tac_table_count = para.controls.iter()
             .filter(|c| matches!(c, Control::Table(t) if t.attr & 0x01 != 0))
             .count();
-        let post_table_start = if table.attr & 0x01 != 0 {
+        let post_table_start = if tac_wrap_split {
+            (pre_table_end_line + 1).min(total_lines).max(1)
+        } else if table.attr & 0x01 != 0 {
             pre_table_end_line.max(1)
         } else if is_last_table && !is_first_table {
             0
@@ -1645,12 +2190,26 @@ impl TypesetEngine {
             let first_row_splittable = (first_block_is_single_row || !first_block_protected)
                 && can_intra_split
                 && mt.is_row_splittable(0);
+            // [Task #874 #6] 한컴 PDF (aift.hwp p19~20 표 pi=236 "기능 간 이벤트 연계
+            // 구성도 이미지") 정합: 1×1 표 의 셀이 content 보다 훨씬 큰 cell.height
+            // 를 가질 때 (line_count == 1 → is_row_splittable=false 라 의도 분할 불가)
+            // 한컴은 page 경계에서 셀 빈 영역을 자르고 다음 페이지로 연속 렌더한다.
+            // can_intra_split 이고 첫 행이 가용 공간보다 큰 force-split 케이스로 분기.
+            let first_row_force_splittable = !first_block_protected
+                && can_intra_split
+                && remaining_on_page > 0.0;
             let min_content = if first_row_splittable {
                 mt.min_first_line_height_for_row(0, 0.0) + mt.max_padding_for_row(0)
+            } else if first_row_force_splittable {
+                // force-split 케이스: 콘텐츠 한 줄 + padding 정도면 분할 가능
+                let pad = mt.max_padding_for_row(0);
+                let line_h = mt.row_heights.first().copied().unwrap_or(0.0).min(20.0);
+                pad + line_h
             } else {
                 f64::MAX
             };
-            if !first_row_splittable || remaining_on_page < min_content {
+            if (!first_row_splittable && !first_row_force_splittable)
+                || remaining_on_page < min_content {
                 st.advance_column_or_new_page();
             }
         }
@@ -1705,10 +2264,31 @@ impl TypesetEngine {
             } else {
                 0.0
             };
+            // [Task #874 #9] 첫 fragment 의 page_avail 은 host_spacing.before 와
+            // (TopAndBottom + vert=Para + v_offset>0 표의) vertical_offset 를 제외해야 한다.
+            // layout 은 표를 cur_h + host_spacing.before + v_offset 위치에 배치하지만,
+            // typeset 의 page_avail = (table_available - cur_h) 은 두 overhead 를
+            // 포함하지 않아 split 결정 시 actual 가용보다 과대 평가됨 → partial 오버플로우.
+            // aift.hwp p44 pi=584: 41.6 px split_end → 실제 가용 36 px → overflow 37.6 px.
+            let host_before_overhead = if is_continuation { 0.0 } else { ft.host_spacing.before };
+            let vert_offset_overhead = if is_continuation {
+                0.0
+            } else {
+                use crate::model::shape::{TextWrap as TW3, VertRelTo as VR3};
+                let is_para_topbottom = !table.common.treat_as_char
+                    && matches!(table.common.text_wrap, TW3::TopAndBottom)
+                    && matches!(table.common.vert_rel_to, VR3::Para);
+                // HwpUnit=u32 이므로 음수 (u32 wrap) 는 i32 로 캐스트 후 확인.
+                let v_off_i32 = table.common.vertical_offset as i32;
+                if is_para_topbottom && v_off_i32 > 0 {
+                    hwpunit_to_px(v_off_i32, self.dpi)
+                } else { 0.0 }
+            };
             let page_avail = if is_continuation {
                 base_available
             } else {
-                (table_available - st.current_height - caption_extra).max(0.0)
+                (table_available - st.current_height - caption_extra
+                    - host_before_overhead - vert_offset_overhead).max(0.0)
             };
 
             let header_overhead = if is_continuation && mt.repeat_header && mt.has_header_cells && row_count > 1 {
@@ -1802,8 +2382,15 @@ impl TypesetEngine {
                         let total_content = mt.remaining_content_for_row(r, 0.0);
                         let remaining_content = total_content - avail_content_for_r;
                         let min_first_line = mt.min_first_line_height_for_row(r, 0.0);
+                        // [Task #713] avail_content_for_r 가 한 줄 정도로 너무 작으면 (orphan)
+                        // 분할 대신 행 전체를 다음 페이지로 push. 한컴은 페이지 끝의 작은
+                        // sliver(예: 17.6 px) 를 두지 않고 행 단위로 이동
+                        // (2022 국립국어원 p31 row 8 케이스). 임계값 25 px 는
+                        // synam-001 의 정합 분할 (27.3 px) 과 본 결함 (17.6 px) 사이.
+                        const MIN_TOP_KEEP_PX: f64 = 25.0;
                         if avail_content_for_r >= MIN_SPLIT_CONTENT_PX
                             && avail_content_for_r >= min_first_line
+                            && avail_content_for_r >= MIN_TOP_KEEP_PX
                             && remaining_content >= MIN_SPLIT_CONTENT_PX
                         {
                             end_row = r + 1;
@@ -2001,11 +2588,20 @@ impl TypesetEngine {
     ) {
         st.flush_column();
 
+        // [Task #874 Case 5] leaving zone 의 height 계산 시 마지막 라인의 trailing
+        // line_spacing 을 제외한다. zone 간 gap 은 design_spacing/2 + solo_zone_pad 가
+        // 이미 담당하므로 vpos_zone_height 에 trailing_ls 까지 더하면 이중 가산.
+        // 한컴 PDF 측정 (shortcut.hwp 1쪽): 본문 첫 줄 top 195.3 px (Hancom) vs 210.7 px
+        // (rhwp pre) = +15.4 px (≈11.5pt) 넓다. 제목 paragraph 의 trailing_ls 16 px 이
+        // vpos_zone_height 에 포함되어 다음 zone(헤더 띠 + 본문)을 일괄 16 px 하향.
+        // pi=80 (21_언어_기출_편집가능본 test_544) 회귀 없음 — pi=80 은 zone 내부 box
+        // 인접 paragraph 로 trailing_ls 가 layout 의 y_offset 에서 포함됨 (이 변경은 zone
+        // 전환 시의 vpos_zone_height 만 수정).
         let vpos_zone_height = if para_idx > 0 {
             let mut max_vpos_end: i32 = 0;
             for prev_idx in (0..para_idx).rev() {
                 if let Some(last_seg) = paragraphs[prev_idx].line_segs.last() {
-                    let vpos_end = last_seg.vertical_pos + last_seg.line_height + last_seg.line_spacing;
+                    let vpos_end = last_seg.vertical_pos + last_seg.line_height;
                     if vpos_end > max_vpos_end {
                         max_vpos_end = vpos_end;
                     }
@@ -2020,7 +2616,74 @@ impl TypesetEngine {
         } else {
             st.current_height
         };
-        st.current_zone_y_offset += vpos_zone_height;
+        // [Task #853] zone 전환 시 디자인 spacing(1단 ColumnDef 의 `간격`)을 세로 간격으로:
+        // (이전 zone 디자인 spacing /2) + (새 zone 디자인 spacing /2) 를 더한다.
+        // shortcut.hwp 1쪽: 제목 zone(0mm) → 헤더 띠 zone(10mm) → 본문 zone(2단, 0)
+        //   → 제목↔헤더 = 5mm, 헤더↔본문 = 5mm (한컴 PDF 정합).
+        let new_ds = paragraphs[para_idx].controls.iter().find_map(|c| {
+            if let Control::ColumnDef(cd) = c { Some(column_def_design_spacing_px(cd, self.dpi)) } else { None }
+        }).unwrap_or(0.0);
+        // [Task #866] 직전 zone 의 마지막 paragraph 가 wrap=위아래 인 글자처럼-취급 표(헤더 띠)를
+        // 보유하고 그 zone 의 1단 ColumnDef 간격이 0 이면, 한컴은 표 band 높이(표 본체 +
+        // outer_margin top/bottom)만큼을 표 아래에 추가로 비워둔다(한컴 PDF 측정:
+        // shortcut.hwp 2·3쪽 헤더 띠 하단↔본문 ~28~33px). ColumnDef 간격>0 인 헤더 띠(1쪽
+        // 등)는 그 간격이 이미 zone 사이 여백이 되므로 제외.
+        // [Task #874 Stage 2] design_spacing 조건을 ≤ 1mm(=3.8px) 까지 인정. 페이지 break 후
+        // current_zone_design_spacing_px 가 stale state 로 1mm 남은 경우 (shortcut.hwp 6쪽
+        // pi=210 '도구' 헤더띠 zone cd 가 pi=209 cd=1mm 인 케이스) 도 헤더띠 leaving 으로 식별.
+        let tac_band_extra: f64 = if st.current_zone_design_spacing_px < 4.0 {
+            (0..para_idx).rev()
+                .find(|&i| !paragraphs[i].line_segs.is_empty())
+                .and_then(|pi| paragraphs[pi].controls.iter().find_map(|c| match c {
+                    Control::Table(t)
+                        if t.common.treat_as_char
+                            && matches!(t.common.text_wrap, crate::model::shape::TextWrap::TopAndBottom) =>
+                        Some(hwpunit_to_px(t.common.height as i32, self.dpi)
+                            + hwpunit_to_px(t.outer_margin_top as i32, self.dpi)
+                            + hwpunit_to_px(t.outer_margin_bottom as i32, self.dpi)),
+                    _ => None,
+                }))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        // [Task #866 v2 Stage 2/4] zone 전환 시 추가 세로 여백.
+        // (1) 1단/간격=0 zone(헤더 띠 / `<...>` 소제목) 진입·이탈: +1500 HU(=20px).
+        //     shortcut.hwp 4쪽 `개체 모양 복사`↔`<스타일에서>`, 6쪽 `도구`↔`맞춤법 검사` 등.
+        // (2) [단나누기](ColumnBreakType::Column) 로 시작하는 새 zone: +1500 HU(=20px).
+        //     배분 다단 zone 의 마지막 컬럼 [단나누기] = 같은 ColumnDef 로 새 밴드 → 한컴 PDF
+        //     상 이전 밴드와 ~한 본문 줄 간격(shortcut.hwp 3쪽 `화면 확대 100%`↔`<편집 화면
+        //     분할에서>`). Stage 1 의 Distribute 마지막 컬럼 라우팅과 정합.
+        let entering_solo_zero = paragraphs[para_idx].controls.iter().any(|c| matches!(c,
+            Control::ColumnDef(cd) if cd.column_count.max(1) <= 1 && cd.spacing == 0));
+        let leaving_solo_zero = st.col_count <= 1 && st.current_zone_design_spacing_px < 0.5;
+        // [Task #866 v3 Stage 1] 헤더 띠 zone (TAC wrap=TopAndBottom 표) 의 leaving 은
+        // `tac_band_extra` 가 이미 표 band 높이만큼 패딩을 추가하므로 `solo_zone_pad` 를 또
+        // 더하면 한컴 PDF 대비 본문 첫 줄이 ~13pt 더 아래로 밀려 사용자 "넓다" 피드백 발생.
+        // tac_band_extra>0 == 헤더 띠 leaving 케이스 → solo_zone_pad 의 leaving 분기 제외.
+        let leaving_is_header_band = leaving_solo_zero && tac_band_extra > 0.5;
+        let column_break_new_band = paragraphs[para_idx].column_type == ColumnBreakType::Column;
+        let solo_zone_pad = if entering_solo_zero
+            || (leaving_solo_zero && !leaving_is_header_band)
+            || column_break_new_band {
+            hwpunit_to_px(1200, self.dpi)
+        } else { 0.0 };
+        let candidate_offset = st.current_zone_y_offset + vpos_zone_height + tac_band_extra
+            + st.current_zone_design_spacing_px / 2.0 + new_ds / 2.0 + solo_zone_pad;
+
+        // [Task #853] 새 zone 이 현재 페이지 하단 가까이(여유 ≲ 헤더 띠 1개 높이)에서 시작하면
+        // 그 zone 의 콘텐츠(헤더 띠 ~47px 또는 본문 줄들)가 body 하단을 넘어 렌더되므로 다음
+        // 페이지로 넘긴다. (shortcut.hwp 3쪽~6쪽 — 다단 zone 다수 누적 시 잔여 콘텐츠가
+        // 본문영역을 넘어 바닥 여백에 그려지던 결함)
+        let one_line = hwpunit_to_px(1500, self.dpi);
+        if candidate_offset > st.layout.available_body_height() - 4.0 * one_line {
+            st.push_new_page();
+            // 새 페이지 첫 zone: 새 zone 디자인 spacing /2 만 (이전 zone 은 이전 페이지).
+            st.current_zone_y_offset = new_ds / 2.0;
+        } else {
+            st.current_zone_y_offset = candidate_offset;
+        }
+        st.current_zone_design_spacing_px = new_ds;
         st.current_column = 0;
         st.current_height = 0.0;
         st.on_first_multicolumn_page = true;
@@ -2031,9 +2694,106 @@ impl TypesetEngine {
                 let new_layout = PageLayoutInfo::from_page_def(page_def, cd, self.dpi);
                 st.current_zone_layout = Some(new_layout.clone());
                 st.layout = new_layout;
+                // [Task #702] 새 zone 의 ColumnType 반영. Distribute(배분) 단에서
+                // 짧은 컬럼 vpos-reset 검출 임계값 완화용.
+                st.current_zone_column_type = cd.column_type;
                 break;
             }
         }
+    }
+
+    /// [Task #846] 마지막 단에서 명시적 단나누기(`ColumnBreakType::Column`, 새 ColumnDef 없음)
+    /// 를 만났을 때: 새 페이지가 아니라 같은 col_count 로 같은 페이지에 새 단-밴드를 시작한다
+    /// (≈ 닫힌 #768). 단, 새 밴드가 본문에 들어갈 공간(이 문단 첫 줄)이 없으면 새 페이지로 넘긴다.
+    /// 규칙: `누적_밴드_높이 + 현_밴드_높이(= max(컬럼별 채움)) < 본문_높이` 이면 새 밴드, 아니면 새 페이지.
+    fn start_new_column_band(
+        &self,
+        st: &mut TypesetState,
+        para_idx: usize,
+        paragraphs: &[Paragraph],
+    ) {
+        st.flush_column();
+
+        // 새 밴드로 들어갈 콘텐츠에 떠다니는(글자처럼 취급이 아닌) 개체가 있으면
+        // 같은 페이지에 밴드를 만들지 않고 새 페이지로 넘긴다.
+        if Self::upcoming_band_has_floating_object(para_idx, paragraphs) {
+            st.push_new_page();
+            return;
+        }
+
+        // 방금 닫힌 밴드의 높이 = 그 밴드 각 단의 마지막 문단 vpos_end 중 최댓값.
+        let zone_off = st.current_zone_y_offset;
+        let mut band_height_px = 0.0_f64;
+        if let Some(page) = st.pages.last() {
+            for cc in page.column_contents.iter().rev() {
+                if cc.zone_y_offset != zone_off {
+                    break;
+                }
+                let last_para_idx = cc.items.last().map(|it| match it {
+                    PageItem::FullParagraph { para_index }
+                    | PageItem::PartialParagraph { para_index, .. }
+                    | PageItem::Table { para_index, .. }
+                    | PageItem::PartialTable { para_index, .. }
+                    | PageItem::Shape { para_index, .. } => *para_index,
+                });
+                if let Some(pi) = last_para_idx {
+                    if let Some(seg) = paragraphs.get(pi).and_then(|p| p.line_segs.last()) {
+                        let v = hwpunit_to_px(
+                            seg.vertical_pos + seg.line_height + seg.line_spacing,
+                            self.dpi,
+                        );
+                        if v > band_height_px {
+                            band_height_px = v;
+                        }
+                    }
+                }
+            }
+        }
+        if band_height_px <= 0.0 {
+            band_height_px = st.current_height;
+        }
+
+        let first_line_h = paragraphs
+            .get(para_idx)
+            .and_then(|p| p.line_segs.first())
+            .map(|s| hwpunit_to_px(s.line_height + s.line_spacing, self.dpi))
+            .filter(|h| *h > 0.0)
+            .unwrap_or(1.0);
+        let room_after_band = st.available_height() - band_height_px;
+
+        if room_after_band >= first_line_h {
+            st.current_zone_y_offset += band_height_px;
+            st.current_column = 0;
+            st.current_height = 0.0;
+            st.on_first_multicolumn_page = true;
+        } else {
+            st.push_new_page();
+        }
+    }
+
+    /// 명시적 단나누기 다음 밴드(= `para_idx` 부터 다음 나누기/새 ColumnDef 직전까지)에
+    /// 떠다니는 개체(글자처럼 취급이 아닌 표/그림/그리기 개체)가 있는지.
+    fn upcoming_band_has_floating_object(para_idx: usize, paragraphs: &[Paragraph]) -> bool {
+        for (offset, p) in paragraphs[para_idx..].iter().enumerate() {
+            if offset > 0
+                && (p.column_type != ColumnBreakType::None
+                    || p.controls.iter().any(|c| matches!(c, Control::ColumnDef(_))))
+            {
+                break;
+            }
+            for ctrl in &p.controls {
+                let floating = match ctrl {
+                    Control::Table(t) => !t.common.treat_as_char,
+                    Control::Shape(s) => !s.common().treat_as_char,
+                    Control::Picture(pic) => !pic.common.treat_as_char,
+                    _ => false,
+                };
+                if floating {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     // ========================================================
@@ -2084,12 +2844,39 @@ impl TypesetEngine {
                     Control::PageHide(ph) => {
                         page_hides.push((pi, ph.clone()));
                     }
+                    Control::Table(table) => {
+                        Self::collect_pagehide_in_table(table, pi, &mut page_hides);
+                    }
                     _ => {}
                 }
             }
         }
 
         (hf_entries, page_number_pos, new_page_numbers, page_hides)
+    }
+
+    /// 표 셀 안 paragraph 의 PageHide 를 재귀 수집.
+    /// 외부 paragraph index `pi` 를 그대로 사용해 페이지 매핑 정합성 유지.
+    fn collect_pagehide_in_table(
+        table: &crate::model::table::Table,
+        pi: usize,
+        page_hides: &mut Vec<(usize, crate::model::control::PageHide)>,
+    ) {
+        for cell in &table.cells {
+            for cp in &cell.paragraphs {
+                for ctrl in &cp.controls {
+                    match ctrl {
+                        Control::PageHide(ph) => {
+                            page_hides.push((pi, ph.clone()));
+                        }
+                        Control::Table(inner) => {
+                            Self::collect_pagehide_in_table(inner, pi, page_hides);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     /// 페이지 번호 + 머리말/꼬리말 최종 할당 (기존 Paginator::finalize_pages와 동일)
@@ -2143,7 +2930,9 @@ impl TypesetEngine {
             page.page_number = page_num;
             page.active_header = current_header.clone();
             page.active_footer = current_footer.clone();
-            page.page_number_pos = page_number_pos.clone();
+            if !assigner.should_hide_page_number() {
+                page.page_number_pos = page_number_pos.clone();
+            }
 
             // PageHide: 해당 문단이 이 페이지에서 **처음** 시작하는 경우만 적용
             // (engine.rs 의 동일 로직과 일치 — 머리말/꼬리말/바탕쪽/페이지번호 감추기)
@@ -2577,5 +3366,85 @@ mod tests {
     #[test]
     fn test_typeset_vs_paginator_biz_plan() {
         compare_with_hwp_file("samples/biz_plan.hwp");
+    }
+
+    /// Issue #703: BehindText/InFrontOfText 표는 본문 흐름에서 제외되어야 한다.
+    ///
+    /// 글뒤로 (BehindText) / 글앞으로 (InFrontOfText) 표는 시각적으로 본문 텍스트 뒤/앞에
+    /// 절대 좌표로 배치되는 데코레이션 (워터마크/배경 등) 이며, 본문 흐름의 vertical advance 에
+    /// 영향을 주지 않는다. `pagination/engine.rs:976-981` 와 동일 시멘틱.
+    ///
+    /// 결함 메커니즘: typeset_block_table → place_table_with_text → `cur_h += table_total_height`
+    /// (line 1594) 가 BehindText/InFrontOfText 표에 대해서도 적용되어 본문 흐름 누적이 발생.
+    ///
+    /// 본 테스트는 BIG BehindText 표 (≈300 mm 높이) 를 1 페이지 본문 안에 넣어두고 후속
+    /// paragraph 가 동일 페이지에 들어감을 검증한다. 결함 시 BehindText 표의 거대 height 가
+    /// cur_h 에 가산되어 후속 paragraph 가 다음 페이지로 밀림.
+    #[test]
+    fn test_typeset_703_behind_text_table_no_flow_advance() {
+        use crate::model::shape::TextWrap;
+        let engine = TypesetEngine::with_default_dpi();
+        let paginator = Paginator::with_default_dpi();
+        let styles = ResolvedStyleSet::default();
+        let page_def = a4_page_def();
+        let col_def = ColumnDef::default();
+        let composed: Vec<ComposedParagraph> = Vec::new();
+
+        // BehindText 1×1 표: 본문 높이의 약 80% 차지 (60000 HU ≈ 800 px @96dpi).
+        // BehindText 는 데코레이션이므로 본문 흐름 누적 0 이어야 정상.
+        // 결함 시 cur_h 에 800 px 가산 → 후속 1 단락도 fit 실패 → 페이지 분할.
+        let mut table = crate::model::table::Table {
+            row_count: 1,
+            col_count: 1,
+            cells: vec![crate::model::table::Cell {
+                col: 0, row: 0, col_span: 1, row_span: 1,
+                width: 51974, height: 60000,
+                paragraphs: vec![Paragraph::default()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        table.common.text_wrap = TextWrap::BehindText;
+        table.common.treat_as_char = false;
+        table.common.width = 51974;
+        table.common.height = 60000; // ≈800 px @96dpi — 본문 80% 점유 (결함 시 가산되는 양)
+
+        let host_para = Paragraph {
+            line_segs: vec![LineSeg {
+                line_height: 1000, line_spacing: 600,
+                ..Default::default()
+            }],
+            controls: vec![crate::model::control::Control::Table(Box::new(table))],
+            ..Default::default()
+        };
+
+        // 후속 5 단락 — 본문 정상 흐름이면 호스트(21px) + 5 × 13px = 86 px (1 페이지 여유)
+        // 결함 시 호스트(21+800=821px) + 첫 단락(13px) = 834 px 도 fit, 더 추가 시 결국 분할
+        // → 단순히 페이지 수 정확히 비교 필요.
+        let mut paras = vec![host_para];
+        for _ in 0..5 {
+            paras.push(make_paragraph_with_height(1000));
+        }
+
+        let (paginator_result, measured) = paginator.paginate(
+            &paras, &composed, &styles, &page_def, &col_def, 0,
+        );
+        let typeset_result = engine.typeset_section(
+            &paras, &composed, &styles, &page_def, &col_def, 0,
+            &measured.tables, false,
+        );
+
+        // 검증 1: paginator (engine.rs reference) 는 1 페이지에 모두 배치
+        assert_eq!(
+            paginator_result.pages.len(), 1,
+            "[reference] BehindText 표 + 5 후속 paragraph 는 paginator 에서 1 페이지에 들어가야 함",
+        );
+
+        // 검증 2: typeset 결과도 1 페이지 (현재 결함 시 RED — typeset 이 BehindText 표 height 를 누적)
+        assert_eq!(
+            typeset_result.pages.len(), 1,
+            "[BUG #703] typeset 도 1 페이지여야 함. 결함 시 BehindText 표 height ≈800 px 가 \
+             cur_h 에 가산되어 후속 paragraph 가 다음 페이지로 밀림 (RED)",
+        );
     }
 }
