@@ -109,6 +109,8 @@ fn build_document(
         preview: None,
         bin_data_content,
         extra_streams: Vec::new(),
+        // HWPML(모던) 은 HWP3-origin 변환본이 아니므로 false (v0.7.13 신규 필드).
+        is_hwp3_variant: false,
     }
 }
 

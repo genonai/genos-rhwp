@@ -51,6 +51,22 @@ pub fn parse_i32(attr: &quick_xml::events::attributes::Attribute) -> i32 {
     attr_str(attr).parse().unwrap_or(0)
 }
 
+/// HWPX는 음수 HWPUNIT 값을 unsigned 32-bit decimal 문자열로 저장하는 경우가 있다.
+///
+/// 예: `4294964867`은 HWP5 little-endian 필드에서 `0xfffff683`, 즉 signed `-2429`이다.
+/// 일반 `i32::parse`는 이 값을 overflow로 실패하므로, 먼저 i32를 시도하고 실패하면
+/// u32로 읽어 wrapping cast 한다.
+pub fn parse_i32_wrapping(attr: &quick_xml::events::attributes::Attribute) -> i32 {
+    let s = attr_str(attr);
+    if let Ok(v) = s.parse::<i32>() {
+        return v;
+    }
+    if let Ok(v) = s.parse::<u32>() {
+        return v as i32;
+    }
+    0
+}
+
 /// "#RRGGBB" → 0x00BBGGRR, "#AARRGGBB" → 0xAABBGGRR (alpha 보존)
 pub fn parse_color(attr: &quick_xml::events::attributes::Attribute) -> u32 {
     let s = attr_str(attr);
@@ -107,6 +123,17 @@ pub fn parse_hatch_style(value: &str) -> Option<i32> {
     }
 }
 
+/// OWPML gradient type 값을 HWP5 gradient kind 값으로 변환한다.
+pub fn parse_gradient_type(value: &str) -> i16 {
+    match value {
+        "LINEAR" => 1,
+        "RADIAL" => 2,
+        "CONICAL" => 3,
+        "SQUARE" => 4,
+        _ => value.parse().unwrap_or(0),
+    }
+}
+
 /// XML 요소를 자식 포함하여 건너뛰기 (깊이 추적)
 pub fn skip_element(reader: &mut Reader<&[u8]>, _end_tag: &[u8]) -> Result<(), HwpxError> {
     let mut buf = Vec::new();
@@ -148,7 +175,7 @@ mod tests {
         assert_eq!(parse_color_str("#00FF00"), 0x0000FF00); // 초록
         assert_eq!(parse_color_str("#0000FF"), 0x00FF0000); // 파랑
         assert_eq!(parse_color_str("#000000"), 0x00000000); // 검정
-        assert_eq!(parse_color_str("none"), 0xFFFFFFFF);    // 투명
+        assert_eq!(parse_color_str("none"), 0xFFFFFFFF); // 투명
     }
 
     #[test]

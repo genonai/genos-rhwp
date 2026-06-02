@@ -1,4 +1,7 @@
 import { WasmBridge } from '@/core/wasm-bridge';
+import type { LayerRenderProfile } from '@/core/types';
+import type { CanvasKitLayerRenderer } from './canvaskit-renderer';
+import type { RenderBackend } from './render-backend';
 
 /**
  * PageLayerTree JSON 의 PaintOp::Image 메타정보 (Task #516, Stage 5.2).
@@ -12,6 +15,7 @@ export interface OverlayImageInfo {
   brightness: number;
   contrast: number;
   watermark?: { preset: 'hancom-watermark' | 'custom' };
+  bakedWatermark?: boolean;
   wrap: 'behindText' | 'inFrontOfText';
   transform?: { rotation: number; horzFlip: boolean; vertFlip: boolean };
 }
@@ -26,7 +30,12 @@ export class PageRenderer {
   private reRenderTimers = new Map<number, ReturnType<typeof setTimeout>[]>();
   private imageRetryCounts = new Map<number, number>();
 
-  constructor(private wasm: WasmBridge) {}
+  constructor(
+    private wasm: WasmBridge,
+    private backend: RenderBackend = 'canvas2d',
+    private renderProfile: LayerRenderProfile = 'screen',
+    private canvaskitRenderer: CanvasKitLayerRenderer | null = null,
+  ) {}
 
   /** 페이지를 Canvas에 렌더링한다 (renderScale = zoom × DPR) */
   renderPage(
@@ -36,6 +45,11 @@ export class PageRenderer {
     displayScale: number,
     dpr: number,
   ): void {
+    if (this.backend === 'canvaskit') {
+      this.renderPageCanvasKit(pageIdx, canvas, renderScale);
+      return;
+    }
+
     // Task #516 Stage 5.2: 다층 layer 모드.
     // 1) 본문 Canvas 는 'flow' 필터로 BehindText/InFrontOfText 그림 제외
     // 2) overlay (BehindText / InFrontOfText) 는 같은 부모 컨테이너에 <img> 로 추가
@@ -43,6 +57,42 @@ export class PageRenderer {
     this.drawMarginGuides(pageIdx, canvas, renderScale);
     const overlays = this.applyOverlays(pageIdx, canvas, displayScale, dpr);
     this.scheduleReRender(pageIdx, canvas, renderScale, overlays.imageCount);
+  }
+
+  getBackend(): RenderBackend {
+    return this.backend;
+  }
+
+  private renderPageCanvasKit(
+    pageIdx: number,
+    canvas: HTMLCanvasElement,
+    renderScale: number,
+  ): void {
+    if (!this.canvaskitRenderer) {
+      throw new Error('CanvasKit renderer가 초기화되지 않았습니다');
+    }
+
+    const parent = canvas.parentElement;
+    if (parent) {
+      this.removePageLayers(parent, pageIdx);
+    }
+
+    const pageInfo = this.wasm.getPageInfo(pageIdx);
+    canvas.width = Math.max(1, Math.floor(pageInfo.width * renderScale));
+    canvas.height = Math.max(1, Math.floor(pageInfo.height * renderScale));
+
+    const tree = this.wasm.getPageLayerTreeObject(pageIdx, this.renderProfile);
+    try {
+      this.canvaskitRenderer.renderPage(tree, canvas, renderScale, pageInfo);
+    } catch (error) {
+      this.canvaskitRenderer.recordRenderFailure(error);
+      console.error(`[PageRenderer] CanvasKit 페이지 렌더링 실패 (page=${pageIdx}):`, error);
+      this.cancelReRender(pageIdx);
+      this.imageRetryCounts.delete(pageIdx);
+      return;
+    }
+    this.cancelReRender(pageIdx);
+    this.imageRetryCounts.delete(pageIdx);
   }
 
   /**
@@ -177,25 +227,27 @@ export class PageRenderer {
       el.style.width = `${img.bbox.width * displayScale}px`;
       el.style.height = `${img.bbox.height * displayScale}px`;
       el.style.pointerEvents = 'none';
-      // CSS filter (그림 효과 + 밝기 + 대비)
-      const filterParts: string[] = [];
-      if (img.effect === 'grayScale' || img.effect === 'pattern8x8') {
-        filterParts.push('grayscale(100%)');
-      } else if (img.effect === 'blackWhite') {
-        filterParts.push('grayscale(100%)');
-        filterParts.push('contrast(1000%)');
-      }
-      if (img.brightness !== 0) {
-        filterParts.push(`brightness(${(100 + img.brightness) / 100})`);
-      }
-      if (img.contrast !== 0) {
-        filterParts.push(`contrast(${(100 + img.contrast) / 100})`);
-      }
-      if (filterParts.length > 0) {
-        el.style.filter = filterParts.join(' ');
+      if (!img.bakedWatermark) {
+        // CSS filter (그림 효과 + 밝기 + 대비)
+        const filterParts: string[] = [];
+        if (img.effect === 'grayScale' || img.effect === 'pattern8x8') {
+          filterParts.push('grayscale(100%)');
+        } else if (img.effect === 'blackWhite') {
+          filterParts.push('grayscale(100%)');
+          filterParts.push('contrast(1000%)');
+        }
+        if (img.brightness !== 0) {
+          filterParts.push(`brightness(${(100 + img.brightness) / 100})`);
+        }
+        if (img.contrast !== 0) {
+          filterParts.push(`contrast(${(100 + img.contrast) / 100})`);
+        }
+        if (filterParts.length > 0) {
+          el.style.filter = filterParts.join(' ');
+        }
       }
       // 워터마크는 multiply blend (흰색 배경 = 투명 효과, 텍스트 위 자연 합성).
-      if (img.watermark) {
+      if (img.watermark && !img.bakedWatermark) {
         el.style.mixBlendMode = 'multiply';
         // WebCanvasRenderer 의 워터마크 alpha 정책과 동기화 (#677).
         el.style.opacity = '0.17';
@@ -355,6 +407,12 @@ export class PageRenderer {
   resetImageRetryState(): void {
     this.imageRetryCounts.clear();
   }
+
+  dispose(): void {
+    this.cancelAll();
+    this.canvaskitRenderer?.dispose();
+    this.canvaskitRenderer = null;
+  }
 }
 
 /**
@@ -398,6 +456,7 @@ function toOverlayInfo(op: any, wrap: 'behindText' | 'inFrontOfText'): OverlayIm
     brightness: op.brightness ?? 0,
     contrast: op.contrast ?? 0,
     watermark: op.watermark,
+    bakedWatermark: op.bakedWatermark === true,
     wrap,
     transform: op.transform,
   };
