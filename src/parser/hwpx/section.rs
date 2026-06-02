@@ -86,12 +86,23 @@ fn parse_page_pr(e: &quick_xml::events::BytesStart, page: &mut PageDef) {
         match attr.key.as_ref() {
             b"width" => page.width = parse_u32(&attr),
             b"height" => page.height = parse_u32(&attr),
-            // HWPX에서는 landscape 플래그를 false로 유지한다.
-            // HWPX의 width/height는 이미 실제 용지 방향대로 저장되어 있어
-            // 렌더러가 추가로 교환(swap)할 필요가 없다.
-            // HWP 바이너리는 항상 짧은변=width, 긴변=height로 저장하고
-            // landscape=true일 때 렌더러가 교환하지만, HWPX는 다른 규약을 따른다.
-            b"landscape" => { /* 무시: landscape = false 유지 */ }
+            // HWPX도 HWP5와 동일하게 width/height를 portrait shape(width<height)로
+            // 저장하고 landscape 속성으로 방향을 표시한다. 한컴 GUI 출력(GT) 대조 결과,
+            // landscape="NARROWLY"가 가로, "WIDELY"가 세로였다. 동일 문서의 HWP/HWPX 쌍
+            // (02.hwp ↔ 03.hwpx, 10.hwp ↔ 16.hwpx)에서 같은 가로 방향이 확인됨.
+            // 한컴 공식 OWPML 모델(hancom-io/hwpx-owpml-model/.../enumdef.h)의
+            // PAGELANDSCAPETYPE 정수값(WIDELY=0, NARROWLY=1)도 HWP5 bit0(0=좁게/세로,
+            // 1=넓게/가로)과 일치한다 — 두 포맷이 같은 정수 규약을 공유.
+            // 이전에는 이 속성을 무시해 가로 문서가 세로로 잘못 출력되는 버그가 있었다.
+            b"landscape" => {
+                let value = attr_str(&attr);
+                page.landscape = value == "NARROWLY";
+                if page.landscape {
+                    page.attr |= 0x01;
+                } else {
+                    page.attr &= !0x01;
+                }
+            }
             _ => {}
         }
     }
