@@ -17,6 +17,7 @@ import { insertCommands } from '@/command/commands/insert';
 import { tableCommands } from '@/command/commands/table';
 import { pageCommands } from '@/command/commands/page';
 import { toolCommands } from '@/command/commands/tool';
+import { installPwaFileHandling, type FileHandlingWindowLike } from '@/command/pwa-file-handling';
 import { ContextMenu } from '@/ui/context-menu';
 import { CommandPalette } from '@/ui/command-palette';
 import { showValidationModalIfNeeded } from '@/ui/validation-modal';
@@ -239,6 +240,20 @@ async function initialize(): Promise<void> {
     setupEventListeners();
     setupGlobalShortcuts();
     loadFromUrlParam();
+    installPwaFileHandling(window as FileHandlingWindowLike, {
+      openDocumentBytes(payload) {
+        eventBus.emit('open-document-bytes', payload);
+      },
+      notifyUnsupportedFile(fileName) {
+        showLoadError(new Error(`지원하지 않는 파일 형식입니다: ${fileName}. HWP/HWPX 파일만 지원합니다.`));
+      },
+      notifyError(error) {
+        showLoadError(error);
+      },
+      notifyMultipleFiles(count) {
+        console.warn(`[pwa-file-handling] 여러 파일(${count}개)이 전달되어 첫 번째 파일만 엽니다.`);
+      },
+    });
 
     // E2E 테스트용 전역 노출 (개발 모드 전용)
     if (import.meta.env.DEV) {
@@ -470,16 +485,18 @@ function setupEventListeners(): void {
 
   // 개체 선택 시 회전/대칭 버튼 그룹 표시/숨김
   const rotateGroup = document.querySelector('.tb-rotate-group') as HTMLElement | null;
+  let noteToolbarActive = false;
   if (rotateGroup) {
     eventBus.on('picture-object-selection-changed', (selected) => {
-      rotateGroup.style.display = (selected as boolean) ? '' : 'none';
+      rotateGroup.style.display = (selected as boolean) && !noteToolbarActive ? '' : 'none';
     });
   }
 
   // 머리말/꼬리말 편집 모드 시 도구상자 전환 + 본문 dimming
   const hfGroup = document.querySelector('.tb-headerfooter-group') as HTMLElement | null;
   const hfLabel = hfGroup?.querySelector('.tb-hf-label') as HTMLElement | null;
-  const defaultTbGroups = document.querySelectorAll('#icon-toolbar > .tb-group:not(.tb-headerfooter-group):not(.tb-rotate-group), #icon-toolbar > .tb-sep');
+  const noteGroup = document.querySelector('.tb-note-group') as HTMLElement | null;
+  const defaultTbGroups = document.querySelectorAll('#icon-toolbar > .tb-group:not(.tb-headerfooter-group):not(.tb-note-group):not(.tb-rotate-group), #icon-toolbar > .tb-sep');
   const scrollContainer = document.getElementById('scroll-container');
   const styleBar = document.getElementById('style-bar');
 
@@ -504,6 +521,20 @@ function setupEventListeners(): void {
         scrollContainer.classList.remove('hf-editing');
       }
     }
+  });
+
+  eventBus.on('footnoteModeChanged', (active) => {
+    const isActive = active as boolean;
+    noteToolbarActive = isActive;
+    if (noteGroup) {
+      noteGroup.style.display = isActive ? '' : 'none';
+    }
+    if (rotateGroup && isActive) {
+      rotateGroup.style.display = 'none';
+    }
+    defaultTbGroups.forEach((el) => {
+      (el as HTMLElement).style.display = isActive ? 'none' : '';
+    });
   });
 }
 
