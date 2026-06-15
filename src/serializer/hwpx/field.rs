@@ -9,8 +9,6 @@
 //! - 누름틀(ClickHere), 날짜, 메일머지 등 복잡한 필드는 `<hp:fieldBegin type="...">` 의
 //!   type 속성만 구분하고 내부 command 직렬화는 #186 에서 확장.
 
-#![allow(dead_code)]
-
 use std::io::Write;
 
 use quick_xml::Writer;
@@ -32,7 +30,31 @@ pub fn write_bookmark<W: Write>(w: &mut Writer<W>, bm: &Bookmark) -> Result<(), 
 // <hp:fieldBegin> / <hp:fieldEnd>
 // =====================================================================
 
-/// `<hp:fieldBegin>` — 필드 시작 마커.
+/// `<hp:fieldBegin>` 여는 태그 + 속성 문자열을 만든다 (자기닫힘 `/>` 없이).
+///
+/// [#1391] parameters / memo subList 가 있으면 호출부가 자식을 채우고 `</hp:fieldBegin>`
+/// 로 닫는다. 없으면 호출부가 `/>` 로 자기닫힘 처리.
+pub fn field_begin_open_tag(field: &Field) -> String {
+    let id_str = field.field_id.to_string();
+    let ft = field_type_str(field.field_type);
+    let name = xml_escape_attr(field.ctrl_data_name.as_deref().unwrap_or(""));
+    format!(
+        r#"<hp:fieldBegin id="{}" type="{}" name="{}" editable="{}""#,
+        id_str,
+        ft,
+        name,
+        bool01(field.is_editable_in_form()),
+    )
+}
+
+fn xml_escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// `<hp:fieldBegin>` — 필드 시작 마커 (자식 없는 경우 자기닫힘).
 ///
 /// HWPX 필드는 텍스트 흐름 안에서 `<hp:fieldBegin>` ~ 텍스트 ~ `<hp:fieldEnd>` 쌍으로 표현된다.
 pub fn write_field_begin<W: Write>(w: &mut Writer<W>, field: &Field) -> Result<(), SerializeError> {
@@ -60,6 +82,7 @@ pub fn write_field_end<W: Write>(w: &mut Writer<W>, field_id: u32) -> Result<(),
 // 하이퍼링크 (필드의 특수형) — <hp:fieldBegin type="HYPERLINK"> 변형
 // =====================================================================
 
+#[allow(dead_code)]
 pub fn write_hyperlink_begin<W: Write>(
     w: &mut Writer<W>,
     link: &Hyperlink,
@@ -86,6 +109,7 @@ pub fn write_hyperlink_begin<W: Write>(
 // =====================================================================
 
 /// `<hp:fn>` 각주 뼈대 (내부 문단 직렬화는 #186 에서 연결).
+#[allow(dead_code)]
 pub fn write_footnote_open<W: Write>(w: &mut Writer<W>, number: u16) -> Result<(), SerializeError> {
     let n = number.to_string();
     start_tag(w, "hp:fn")?;
@@ -93,10 +117,12 @@ pub fn write_footnote_open<W: Write>(w: &mut Writer<W>, number: u16) -> Result<(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn write_footnote_close<W: Write>(w: &mut Writer<W>) -> Result<(), SerializeError> {
     end_tag(w, "hp:fn")
 }
 
+#[allow(dead_code)]
 pub fn write_endnote_open<W: Write>(w: &mut Writer<W>, number: u16) -> Result<(), SerializeError> {
     let n = number.to_string();
     start_tag(w, "hp:en")?;
@@ -104,6 +130,7 @@ pub fn write_endnote_open<W: Write>(w: &mut Writer<W>, number: u16) -> Result<()
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn write_endnote_close<W: Write>(w: &mut Writer<W>) -> Result<(), SerializeError> {
     end_tag(w, "hp:en")
 }
@@ -189,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn footnote_emits_autoNum() {
+    fn footnote_emits_auto_num() {
         let xml = to_string(|w| {
             write_footnote_open(w, 3)?;
             write_footnote_close(w)

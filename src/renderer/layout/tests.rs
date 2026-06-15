@@ -64,6 +64,39 @@ fn test_build_empty_page() {
 }
 
 #[test]
+fn compact_endnote_tail_log_tolerance_allows_line_box_bleed_only() {
+    let col_bottom = 1092.3;
+
+    assert!(is_tolerated_endnote_column_bottom_bleed(
+        true,
+        col_bottom + 43.3,
+        col_bottom
+    ));
+    assert!(!is_tolerated_endnote_column_bottom_bleed(
+        true,
+        col_bottom + 49.0,
+        col_bottom
+    ));
+    assert!(is_tolerated_endnote_column_bottom_bleed_with_limit(
+        true,
+        col_bottom + 64.0,
+        col_bottom,
+        ENDNOTE_EQUATION_TAIL_LINE_BOX_OVERFLOW_LOG_TOLERANCE_PX,
+    ));
+    assert!(!is_tolerated_endnote_column_bottom_bleed_with_limit(
+        true,
+        col_bottom + 69.0,
+        col_bottom,
+        ENDNOTE_EQUATION_TAIL_LINE_BOX_OVERFLOW_LOG_TOLERANCE_PX,
+    ));
+    assert!(!is_tolerated_endnote_column_bottom_bleed(
+        false,
+        col_bottom + 1.0,
+        col_bottom
+    ));
+}
+
+#[test]
 fn test_build_page_with_paragraph() {
     let engine = LayoutEngine::with_default_dpi();
     let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
@@ -88,6 +121,8 @@ fn test_build_page_with_paragraph() {
         layout,
         column_contents: vec![ColumnContent {
             column_index: 0,
+            start_height: 0.0,
+            endnote_flow: false,
             items: vec![PageItem::FullParagraph { para_index: 0 }],
             zone_layout: None,
             zone_y_offset: 0.0,
@@ -193,6 +228,8 @@ fn test_layout_with_composed_styles() {
         layout,
         column_contents: vec![ColumnContent {
             column_index: 0,
+            start_height: 0.0,
+            endnote_flow: false,
             items: vec![PageItem::FullParagraph { para_index: 0 }],
             zone_layout: None,
             zone_y_offset: 0.0,
@@ -317,6 +354,8 @@ fn test_layout_multi_run_x_position() {
         layout,
         column_contents: vec![ColumnContent {
             column_index: 0,
+            start_height: 0.0,
+            endnote_flow: false,
             items: vec![PageItem::FullParagraph { para_index: 0 }],
             zone_layout: None,
             zone_y_offset: 0.0,
@@ -685,6 +724,8 @@ fn test_layout_table_basic() {
         layout,
         column_contents: vec![ColumnContent {
             column_index: 0,
+            start_height: 0.0,
+            endnote_flow: false,
             items: vec![
                 PageItem::FullParagraph { para_index: 0 },
                 PageItem::Table {
@@ -834,6 +875,8 @@ fn test_layout_table_cell_positions() {
         layout,
         column_contents: vec![ColumnContent {
             column_index: 0,
+            start_height: 0.0,
+            endnote_flow: false,
             items: vec![
                 PageItem::FullParagraph { para_index: 0 },
                 PageItem::Table {
@@ -958,6 +1001,7 @@ fn test_expand_numbering_format_digit() {
         ],
         start_number: 0,
         level_start_numbers: [1, 1, 1, 1, 1, 1, 1],
+        raw_para_heads: None,
     };
     let counters = [3, 2, 1, 0, 0, 0, 0];
     let result =
@@ -995,6 +1039,7 @@ fn test_expand_numbering_format_hangul() {
         ],
         start_number: 0,
         level_start_numbers: [1, 1, 1, 1, 1, 1, 1],
+        raw_para_heads: None,
     };
     let counters = [1, 3, 0, 0, 0, 0, 0];
     let result =
@@ -1459,4 +1504,33 @@ fn task296_inline_tab_type_decimal() {
     // ext[2] = 0x0400 → high=4 = DECIMAL
     let ext = [100u16, 0, 0x0400, 0, 0, 0, 9];
     assert_eq!(super::text_measurement::inline_tab_type(&ext), 4);
+}
+
+#[test]
+fn task1197_paper_nodes_sort_by_plane_z_order_and_stable_index() {
+    fn node(id: u32, text_wrap: TextWrap, z_order: i32, stable_index: u32) -> RenderNode {
+        RenderNode::new(
+            id,
+            RenderNodeType::Column(0),
+            BoundingBox::new(0.0, 0.0, 1.0, 1.0),
+        )
+        .with_layer(RenderLayerInfo::new(Some(text_wrap), z_order, stable_index))
+    }
+
+    let mut nodes = vec![
+        node(1, TextWrap::InFrontOfText, 0, 0),
+        node(2, TextWrap::BehindText, 11, 2),
+        node(3, TextWrap::BehindText, 1, 3),
+        node(4, TextWrap::TopAndBottom, 0, 0),
+        node(5, TextWrap::BehindText, 11, 1),
+    ];
+
+    LayoutEngine::sort_paper_render_nodes(&mut nodes);
+
+    let order: Vec<u32> = nodes.iter().map(|node| node.id).collect();
+    assert_eq!(
+        order,
+        vec![3, 5, 2, 4, 1],
+        "BehindText는 z-order/stable 순서로 먼저, flow, InFrontOfText 순으로 정렬"
+    );
 }
