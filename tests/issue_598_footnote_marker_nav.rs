@@ -21,7 +21,7 @@ fn issue_598_body_footnote_marker_has_hit_and_cursor_unit() {
     assert_eq!(doc.get_control_text_positions(0, 3), "[7]");
 
     let hit = doc
-        .hit_test_body_footnote_marker_native(0, 264.0, 380.0)
+        .hit_test_body_footnote_marker_native(0, 264.0, 392.0)
         .expect("hit body footnote marker");
     assert!(hit.contains("\"hit\":true"), "hit json: {hit}");
     assert!(hit.contains("\"sectionIndex\":0"), "hit json: {hit}");
@@ -57,7 +57,7 @@ fn issue_598_second_body_footnote_marker_has_same_cursor_unit() {
     assert_eq!(doc.get_control_text_positions(0, 7), "[6]");
 
     let hit = doc
-        .hit_test_body_footnote_marker_native(0, 214.0, 670.0)
+        .hit_test_body_footnote_marker_native(0, 214.0, 684.0)
         .expect("hit second body footnote marker");
     assert!(hit.contains("\"hit\":true"), "hit json: {hit}");
     assert!(hit.contains("\"paragraphIndex\":7"), "hit json: {hit}");
@@ -81,6 +81,28 @@ fn issue_598_second_body_footnote_marker_has_same_cursor_unit() {
         right_x > left_x,
         "second marker right caret should be after left caret: left={marker_left}, right={marker_right}"
     );
+}
+
+#[test]
+fn endnote_marker_can_be_found_and_deleted_like_footnote() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/endnote-01.hwp");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+    let mut doc = HwpDocument::from_bytes(&bytes).expect("parse endnote-01.hwp");
+
+    // section 0 / para 3 / ctrl 0 is an endnote marker at text position 7.
+    let forward = doc
+        .get_footnote_at_cursor_native(0, 3, 7, "forward")
+        .expect("find endnote after cursor");
+    assert!(forward.contains("\"hit\":true"), "forward json: {forward}");
+    assert!(
+        forward.contains("\"controlIndex\":0"),
+        "forward json: {forward}"
+    );
+
+    let deleted = doc
+        .delete_footnote_native(0, 3, 0)
+        .expect("delete endnote control");
+    assert!(deleted.contains("\"ok\":true"), "deleted json: {deleted}");
 }
 
 #[test]

@@ -4,26 +4,67 @@ import { readFileSync, readFile } from 'fs';
 import { VitePWA } from 'vite-plugin-pwa';
 
 const pkg = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf-8'));
+const subsecondWasmDir = resolve(
+  __dirname,
+  '..',
+  'target',
+  'rhwp-subsecond-vite',
+);
+const useSubsecondWasm = process.env.RHWP_SUBSECOND === '1';
 
 export default defineConfig({
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version),
+    // 셀프 호스팅 빌드에서 외부(CDN) 웹폰트 로드를 빌드 시점에 끈다.
+    // 확장 storage 설정(disableExternalWebFonts)이 있으면 그 값이 우선한다.
+    __RHWP_DISABLE_EXTERNAL_WEBFONTS__: JSON.stringify(
+      process.env.RHWP_DISABLE_EXTERNAL_WEBFONTS === '1',
+    ),
   },
   resolve: {
     alias: {
       '@': resolve(__dirname, 'src'),
+      '@wasm/rhwp.js': useSubsecondWasm
+        ? resolve(subsecondWasmDir, 'rhwp-subsecond.js')
+        : resolve(__dirname, '..', 'pkg', 'rhwp.js'),
       '@wasm': resolve(__dirname, '..', 'pkg'),
     },
   },
   server: {
     host: '127.0.0.1',
     port: 7700,
+    proxy: useSubsecondWasm ? {
+      '/_dioxus': {
+        target: 'http://127.0.0.1:7711',
+        ws: true,
+      },
+      '/wasm': {
+        target: 'http://127.0.0.1:7711',
+      },
+    } : undefined,
     fs: {
       // [Task #741 후속] 외부 file path 그림 영역 영역 samples/ dir 영역 영역 fetch 가능 영역.
-      allow: [__dirname, resolve(__dirname, '..', 'pkg'), resolve(__dirname, '..', 'samples')],
+      allow: [
+        __dirname,
+        resolve(__dirname, '..', 'pkg'),
+        subsecondWasmDir,
+        resolve(__dirname, '..', 'samples'),
+        resolve(__dirname, '..', 'npm', 'editor'),
+      ],
+    },
+    watch: {
+      ignored: ['**/librhwp-subsecond-patch-*.wasm'],
     },
   },
   plugins: [
+    {
+      name: 'ignore-subsecond-patch-artifacts',
+      handleHotUpdate(context) {
+        if (/librhwp-subsecond-patch-\d+\.wasm$/.test(context.file)) {
+          return [];
+        }
+      },
+    },
     // [Task #741 후속] dev 서버 영역 영역 /samples/* 경로 영역 영역 parent samples/ dir 영역
     // 영역 정적 serve 영역 — wasm-bridge.ts 영역 영역 외부 image fetch 영역 영역 영역.
     {
@@ -61,7 +102,7 @@ export default defineConfig({
       manifest: {
         name: 'rhwp-studio',
         short_name: 'rhwp',
-        description: 'HWP/HWPX 뷰어·에디터 — 알(R), 모두의 한글',
+        description: 'HWP/HWPX/HML 뷰어·에디터 — 알(R), 모두의 한글',
         lang: 'ko',
         theme_color: '#2b6cb0',
         background_color: '#ffffff',
@@ -74,6 +115,8 @@ export default defineConfig({
             accept: {
               'application/x-hwp': ['.hwp'],
               'application/hwp+zip': ['.hwpx'],
+              'application/xml': ['.hml'],
+              'text/xml': ['.hml'],
             },
           },
         ],

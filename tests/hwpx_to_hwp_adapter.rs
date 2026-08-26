@@ -9,7 +9,7 @@ use rhwp::document_core::converters::hwpx_to_hwp::{
 };
 use rhwp::document_core::DocumentCore;
 use rhwp::model::control::Control;
-use rhwp::model::document::Document;
+use rhwp::model::document::{Document, Section};
 use rhwp::model::paragraph::Paragraph;
 use rhwp::model::shape::{CommonObjAttr, ShapeObject};
 use rhwp::model::style::FillType;
@@ -143,7 +143,7 @@ fn adapter_skips_hwp_source() {
     let report = convert_if_hwpx_source(&mut doc, rhwp::parser::FileFormat::Hwp);
     assert_eq!(
         report.skipped_reason.as_deref(),
-        Some("source_format != Hwpx|Hwpml|Hwp3")
+        Some("source_format != Hwpx/Hwp3")
     );
 }
 
@@ -352,7 +352,9 @@ fn task888_basic_table_materializes_hancom_table_attrs() {
         table.raw_table_record_attr, 0x0400_0006,
         "HWPX table record attr는 pageBreak/repeatHeader/noAdjust와 안쪽 여백 활성 계약 필드로 재구성한다"
     );
-    assert_eq!(report.table_record_row_sizes_materialized, 1);
+    // [#3062] row_sizes 는 이제 HWPX 파서가 셀 수로 직접 채우므로 어댑터
+    // materialize 는 no-op 이다 (attr 계열과 동일한 "파서가 이미 한다" 계약).
+    assert_eq!(report.table_record_row_sizes_materialized, 0);
     assert_eq!(table.row_sizes, vec![4, 4, 4]);
     assert!(table.raw_ctrl_data.len() >= 4);
     assert_eq!(
@@ -408,7 +410,8 @@ fn task888_expense_report_materializes_tac_table_ctrl_attrs() {
         report.table_ctrl_header_attr_materialized, 0,
         "HWPX 파서가 TAC table CTRL_HEADER attr를 이미 materialize한다"
     );
-    assert_eq!(report.table_record_row_sizes_materialized, 2);
+    // [#3062] row_sizes 는 파서가 직접 채우므로 어댑터 materialize 는 0 이다.
+    assert_eq!(report.table_record_row_sizes_materialized, 0);
 }
 
 #[test]
@@ -633,6 +636,29 @@ fn stage4_page_def_preserved_after_roundtrip() {
     );
 }
 
+#[test]
+fn task1654_hide_empty_line_flag_preserved_after_hwp_export_reload() {
+    let mut section = Section::default();
+    section.section_def.hide_empty_line = true;
+    section.section_def.flags &= !0x0008_0000;
+    section.paragraphs.push(Paragraph::default());
+
+    let mut doc = Document {
+        sections: vec![section],
+        ..Default::default()
+    };
+
+    let report = convert_hwpx_to_hwp_ir(&mut doc);
+    assert_eq!(report.section_def_hide_empty_line_flag_materialized, 1);
+
+    let hwp_bytes = rhwp::serializer::serialize_hwp(&doc).expect("HWP 직렬화 실패");
+    let reloaded = DocumentCore::from_bytes(&hwp_bytes).expect("HWP 재로드 실패");
+    let section_def = &reloaded.document().sections[0].section_def;
+
+    assert!(section_def.hide_empty_line);
+    assert_ne!(section_def.flags & 0x0008_0000, 0);
+}
+
 /// Stage 4 핵심 게이트: 어댑터 적용 → 직렬화 → 재로드 시 페이지 수가 HWP 저장 기준과 일치.
 fn assert_page_count_recovered(name: &str, bytes: &[u8]) {
     let (orig, after) = page_count_with_adapter(bytes);
@@ -687,7 +713,7 @@ fn stage5_export_hwp_with_adapter_hwpx_source_recovers_pages() {
 
 #[test]
 fn stage5_export_hwp_with_adapter_hwp_source_unchanged() {
-    // HWP 원본 — 어댑터는 no-op (source_format != Hwpx|Hwpml)
+    // HWP 원본 — 어댑터는 no-op (source_format != Hwpx)
     let path = "samples/hwp_table_test.hwp";
     let bytes = match std::fs::read(path) {
         Ok(b) => b,

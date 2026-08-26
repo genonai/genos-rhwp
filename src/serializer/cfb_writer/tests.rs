@@ -69,6 +69,8 @@ fn test_serialize_hwp_cfb_streams() {
         extra_streams: Vec::new(),
         hwpx_aux_entries: Vec::new(),
         is_hwp3_variant: false,
+        is_hwpx_variant: false,
+        provenance: Default::default(),
     };
 
     let bytes = serialize_hwp(&doc).unwrap();
@@ -112,6 +114,8 @@ fn test_serialize_hwp_compressed() {
         extra_streams: Vec::new(),
         hwpx_aux_entries: Vec::new(),
         is_hwp3_variant: false,
+        is_hwpx_variant: false,
+        provenance: Default::default(),
     };
 
     let bytes = serialize_hwp(&doc).unwrap();
@@ -132,6 +136,9 @@ fn test_full_roundtrip_uncompressed() {
         raw_data: None,
         name: "함초롬바탕".to_string(),
         alt_type: 0,
+        is_embedded: false,
+        bin_item_id_ref: String::new(),
+        resolved_bin_data_id: None,
         alt_name: None,
         type_info: None,
         default_name: None,
@@ -209,6 +216,8 @@ fn test_full_roundtrip_uncompressed() {
         extra_streams: Vec::new(),
         hwpx_aux_entries: Vec::new(),
         is_hwp3_variant: false,
+        is_hwpx_variant: false,
+        provenance: Default::default(),
     };
 
     // Document → HWP bytes
@@ -287,6 +296,8 @@ fn test_full_roundtrip_compressed() {
         extra_streams: Vec::new(),
         hwpx_aux_entries: Vec::new(),
         is_hwp3_variant: false,
+        is_hwpx_variant: false,
+        provenance: Default::default(),
     };
 
     // Document → HWP bytes (compressed)
@@ -1672,12 +1683,14 @@ fn test_ole_storage_size_prefix_restored() {
         preview: None,
         bin_data_content: vec![BinDataContent {
             id: 1,
-            data: ole_cfb.clone(),
+            data: ole_cfb.clone().into(),
             extension: "OLE".to_string(),
         }],
         extra_streams: Vec::new(),
         hwpx_aux_entries: Vec::new(),
         is_hwp3_variant: false,
+        is_hwpx_variant: false,
+        provenance: Default::default(),
     };
 
     let bytes = serialize_hwp(&doc).unwrap();
@@ -1757,12 +1770,14 @@ fn test_compressed_ole_storage_payload_is_deflated() {
         preview: None,
         bin_data_content: vec![BinDataContent {
             id: 1,
-            data: ole_cfb.clone(),
+            data: ole_cfb.clone().into(),
             extension: "OLE".to_string(),
         }],
         extra_streams: Vec::new(),
         hwpx_aux_entries: Vec::new(),
         is_hwp3_variant: false,
+        is_hwpx_variant: false,
+        provenance: Default::default(),
     };
 
     let bytes = serialize_hwp(&doc).unwrap();

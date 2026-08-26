@@ -39,6 +39,18 @@ npx vite --port 7700
 - 문서 오타/개선
 - [Discussions](https://github.com/edwardkim/rhwp/discussions)에서 질문/아이디어 제안
 
+### 4. 업스트림에 기여할지 먼저 판단하기
+
+rhwp는 모든 파생 제품을 한 저장소에서 직접 만들지 않습니다. 공통 엔진, 공용 Web/WASM API,
+CLI·MCP 계약과 현재 공식 배포 대상의 개선은 rhwp 업스트림에 기여합니다. 특정 운영체제의 데스크톱·
+모바일 앱, 사내 뷰어, Google Docs 연계, 조직별 인증·배포·업무 화면은 별도 다운스트림 프로젝트에서
+구현하는 것을 기본으로 합니다.
+
+두 범위가 섞여 있다면 제품 구현은 다운스트림에 두고, 여러 프로젝트가 재사용할 결함 수정이나 공용
+확장점만 작은 이슈와 PR로 분리해 주세요. 자세한 판단 기준과 공식 배포 범위는
+[프로젝트 로드맵의 업스트림과 다운스트림 경계](ROADMAP.md#업스트림과-다운스트림의-경계)를
+참고하세요.
+
 ## 기여 방법
 
 ### 버그 리포트
@@ -61,12 +73,14 @@ HWP 파일이 한컴과 다르게 렌더링되면 알려주세요:
 1. Fork (GitHub UI)
    edwardkim/rhwp → myid/rhwp
 
-2. Clone
+2. Clone + upstream 등록 (최초 1회)
    git clone https://github.com/myid/rhwp.git
    cd rhwp
+   git remote add upstream https://github.com/edwardkim/rhwp.git
 
-3. 브랜치 생성 + 작업
-   git checkout -b fix/issue-123
+3. 브랜치 생성 + 작업 — 반드시 최신 upstream/devel 기준
+   git fetch upstream
+   git switch -c fix/issue-123 upstream/devel
    (코드 수정 + 테스트)
 
 4. Push (본인 Fork에)
@@ -83,16 +97,93 @@ HWP 파일이 한컴과 다르게 렌더링되면 알려주세요:
 - PR을 생성하면 CI가 자동으로 빌드 + 테스트 + Clippy를 실행합니다
 - CI가 통과하지 않으면 merge할 수 없습니다
 - 메인테이너의 코드 리뷰 승인 후 merge됩니다
+- Issue와 PR은 같은 번호 공간을 쓰며, PR 번호는 **PR 생성이 성공한 시점**에 채번됩니다.
+  생성 전에 다음 번호를 예측하거나, 번호만 확보하기 위해 Draft PR을 만들지 마세요.
+- 구현과 PR 전 검증을 마친 기여는 일반 Open PR로 제출합니다. Draft는 아직 완료되지 않은 WIP에
+  대해 조기 피드백을 요청할 때만 사용합니다.
+- **하나의 PR에 여러 fix를 담을 때는 이슈별로 커밋을 분리**해주세요. 여러 수정이 한 커밋에
+  섞이면 회귀 추적·선별 반영·리뷰가 어려워져 머지가 지연됩니다.
+- **`mydocs/orders/YYYYMMDD.md`는 PR에 포함하지 마세요.** 이 파일은 병합 결과와 후속 작업을 관리하는
+  메인터너 전용 일일 운영 기록입니다. 필요한 기록은 PR 병합 뒤 메인터너가 작성합니다.
+
+### Claude·Codex capability 기여
+
+재사용할 Claude 에이전트·Claude Skill·Codex Skill을 추가하거나 변경하기 전에는
+[에이전트 capability 카탈로그](mydocs/manual/agent_capability_registry.md)를 읽어 기존 기능과 중복되지
+않는지 확인해주세요.
+
+- 같은 사용자 산출물·권위 문서·비범위면 새 기능을 만들지 않고 기존 capability에 어댑터만 추가합니다.
+- 새 capability면 전용 Issue를 먼저 만들고 `CAP-<Issue 번호>`를 사용합니다. 로컬 순번을 임의로
+  정하지 않습니다.
+- 진입점·권위 문서·상태 변경은 같은 PR에서 카탈로그에 반영하고, Codex Skill은 카탈로그의 검증 절에
+  따라 `quick_validate.py`를 실행합니다.
 
 ### PR 전 체크리스트
 
 ```bash
-cargo fmt --all -- --check        # 포맷 정책 준수
-cargo test                       # 1,100+ 테스트 통과
-cargo clippy -- -D warnings      # 린트 경고 0건
+cargo install cargo-nextest --locked             # 최초 1회
+cargo fmt --all -- --check                       # 포맷 정책 준수
+cargo nextest run \
+  --cargo-profile release-test \
+  --target-dir target/pr-review \
+  --tests --test-threads 12 --no-fail-fast       # 통합 테스트 포함 전체
+cargo clippy -- -D warnings                      # 린트 경고 0건
 ```
 
 세 명령이 모두 통과하는지 확인한 후 PR을 생성해주세요.
+
+- `release-test` 프로필은 PR CI와 같은 기준이며 debug 대비 수 배 빠릅니다.
+- 논리 CPU가 12개 미만이거나 메모리가 부족하면 `--test-threads`를 논리 CPU 이하로 낮춰주세요.
+- `cargo test --lib` 만으로는 통합 테스트 회귀를 잡지 못합니다 — `--tests` 를 포함해주세요.
+
+렌더링 변경을 한컴 기준 PDF와 대조할 때는 비교 도구가 최신 실행 파일을 보도록 먼저 다음 빌드를 할 수
+있습니다.
+
+```bash
+cargo build --profile release-test --target-dir target/pr-review
+```
+
+이 명령은 `rhwp` 바이너리를 만들어 시각 대조를 준비할 뿐, 테스트를 실행하지 않습니다. **PR 전 검증을
+대체하지 않으므로**, 코드 변경 뒤에는 위의 전체 `cargo nextest run ... --tests --no-fail-fast`를 반드시
+완료하세요. 상세 절차는 [로컬 사전 검증](mydocs/manual/pr_review/local_validation.md)을 따릅니다.
+
+### 성능 검증 책임
+
+PR을 제출하기 위해 컨트리뷰터가 특정 로컬 환경의 **절대 성능 수치**, 비공개 코퍼스 또는
+메인테이너 전용 벤치마크를 통과할 필요는 없습니다. 하드웨어·OS·폰트·브라우저 상태에 따라 달라지는
+수치는 공통 제출 기준으로 사용할 수 없으며, 통제된 환경의 최종 성능 판정은 메인테이너가 수행합니다.
+
+성능에 영향을 줄 수 있는 PR은 가능한 범위에서 다음을 적어주세요. 측정 환경이 없으면 `미측정`이라고
+명시해도 PR을 제출할 수 있습니다.
+
+- 예상 영향: 개선, 회귀 가능성, 영향 없음 또는 미확인
+- 재현 절차와 사용한 공개 sample
+- 측정했다면 환경과 변경 전후 관측값 — 단일 실행의 절대 시간보다 같은 환경의 상대 비교를 권장
+
+이 정책은 성능 회귀를 면제하지 않습니다. 저장소에 공개된 결정적 성능 회귀 테스트와 GitHub required
+checks는 기존과 같이 merge gate입니다. 추가 환경 검증에서 심각한 회귀를 발견해 merge를 보류할 때는
+메인테이너가 공개 가능한 재현 절차·fixture 또는 자동 래칫을 제공하고 보정 범위를 함께 설명합니다.
+비공개 자료나 특정 메인테이너 장비에서만 재현되는 수치 자체를 컨트리뷰터의 수정 의무로 돌리지 않습니다.
+
+### 회귀 테스트 가이드
+
+버그 수정 PR 에서 리뷰가 가장 먼저 확인하는 항목입니다. 아래 관례를 따르면 검토와 merge 가
+크게 빨라집니다.
+
+1. **red→green 회귀 테스트 동봉** — 수정 전 결함을 재현·고정하는 테스트를 함께 제출합니다.
+   파일명 관례: `tests/issue_{이슈번호}_{짧은_설명}.rs`. 수정을 되돌리면 실패하고, 수정을
+   적용하면 통과해야 합니다.
+2. **수정 전 실패 증명 (권장)** — "수정 커밋만 원복한 상태에서 신규 테스트가 실제로 FAIL"
+   함을 PR 본문에 기록해주세요. 테스트가 결함을 판별한다는 증명이 되어 리뷰 신뢰도가
+   높아집니다.
+3. **기존 기대값(잠정 핀) 변경 시** — 페이지 수 등 잠정 핀 수치를 바꾸는 PR 은 다음을
+   지켜주세요. 임의 갱신은 받지 않습니다.
+   - 정답지 방향 근거 명시 (예: "PDF 정답 315 방향 +3, 잔여 −3")
+   - 테스트 주석에 갱신 이력을 누적 (어떤 이슈의 어떤 정정으로 값이 왜 변했는지 —
+     `tests/issue_2070_rowbreak_density.rs` 의 3단 이력 주석이 모범 사례)
+   - "핀 미만/초과 시 의심 지점" 안내 메시지 유지
+4. **인접 핀 무회귀 확인** — 수정 영역 주변의 알려진 핀 테스트(예: 페이지네이션이면
+   byeolpyo 계열)가 유지되는지 `--no-fail-fast` 로 전체 실행하여 확인해주세요.
 
 ### 포맷 정책
 
@@ -119,9 +210,9 @@ cargo fmt --all -- --check       # CI와 같은 포맷 검증
 신뢰할 수 있는 검증 기준 (우선순위):
 
 1. **결정적 자동 검증** (필수):
-   - `cargo test --lib` (회귀 0)
+   - 위 PR 전 체크리스트의 `cargo nextest run` (통합 테스트 포함, 회귀 0)
    - `cargo test --test svg_snapshot` (rhwp 자체 일관성)
-   - `cargo clippy --lib -- -D warnings`
+   - `cargo clippy -- -D warnings`
 
 2. **시각 검증** (참고):
    - 한컴 PDF / 한컴 화면 캡처 + rhwp SVG 비교 — **본인 환경 명시 필수** (한컴 버전, OS, 폰트 등)
@@ -136,11 +227,53 @@ cargo fmt --all -- --check       # CI와 같은 포맷 검증
 
 1. PR 본문에 검증 환경 명시 (한컴 버전, OS, 폰트, 출력 방법)
 2. 메인테이너 환경 재검증 후 머지 결정 (작업지시자가 직접 확인)
-3. 회귀 테스트 (`tests/page_number_propagation.rs` 같은 패턴) 포함 권장
+3. 회귀 테스트 동봉 — 위 "회귀 테스트 가이드" 절의 관례를 따라주세요
+
+### 렌더링 PR 자가 검증 도구 (한컴 없이 가능)
+
+렌더링·레이아웃을 수정하는 PR 은 제출 전 아래 도구로 자가 검증하면 리뷰 왕복이 크게
+줄어듭니다. 모두 **한컴 설치 없이** (macOS/Linux 포함) 실행할 수 있습니다.
+
+```bash
+# 개체(표·그림) geometry 무회귀 — 원커맨드: devel 을 worktree 빌드해 baseline 자동 생성 후
+# 현 트리와 대조, PR 본문용 markdown 요약(output/ovr/ovr_diff.md)까지 출력
+python tools/object_visual_regression.py --preset ovr5 -o output/ovr --diff-against devel
+
+# (수동 3단계 흐름도 그대로 동작 — 수정 전 baseline 저장, 수정 후 비교)
+python tools/object_visual_regression.py <샘플.hwp> -o output/ovr --no-hwp --save-baseline
+python tools/object_visual_regression.py <샘플.hwp> -o output/ovr2 --no-hwp --baseline output/ovr/baseline.json
+
+# 편집-스윕 — 편집 경로 PR(vpos·pagination·undo)의 가짜 페이지 변동 검출
+# devel 과 브랜치에서 각각 스윕 → 공통/해소/신규 분류 리포트 (신규 존재 시 exit 1)
+cargo run --release --example edit_sweep -- samples -o output/sweep/branch.tsv
+cargo run --release --example edit_sweep -- --compare output/sweep/devel.tsv output/sweep/branch.tsv -o output/sweep/report.md
+
+# 라운드트립 시각 기하 회귀
+cargo run --release --bin rhwp -- render-diff <샘플.hwp>
+
+# HWPX→HWP 변환 페이지네이션 정합
+python tools/roundtrip_fidelity_harness.py --files <샘플.hwpx> --workdir output/rtf -o output/rtf/result.tsv
+```
+
+- OVR(개체 시각 회귀)로 "변경 범위 밖 문서의 개체가 움직이지 않았음"을 결과와 함께
+  PR 본문에 적어주시면 리뷰가 빨라집니다 — `--diff-against devel` 이 출력하는
+  `ovr_diff.md` 표를 그대로 붙여넣으면 됩니다 (git 상태 전환·baseline 관리 불필요).
+- 어떤 PR 에 어떤 시각 증거가 필요한지는
+  [시각 검증 거버넌스](mydocs/manual/verification/visual_verification_governance.md)를 참고하세요 —
+  시각 검증은 전수 절차가 아니라 **PR 의 수정 목적과 사용자에게 보이는 동작 기준으로 선택**합니다.
+- 전체 CLI 도구는 [cli_commands.md](mydocs/manual/cli_commands.md) 참조.
+- 자가 검증 통과는 회귀 없음의 증명이며, 한컴 정합의 최종 판정은 메인테이너 환경에서
+  이루어집니다.
 
 ### HWP 샘플 파일 제공
 
 다양한 HWP 파일로 테스트할수록 렌더링 품질이 올라갑니다. 개인정보가 없는 공공 문서나 테스트용 파일을 제공해주시면 큰 도움이 됩니다.
+
+- **스크린샷·비교 이미지는 저장소에 커밋하지 말고 PR 본문에 첨부**해주세요 (필요 시
+  메인테이너가 판정 자료를 `mydocs/pr/assets/` 에 반영합니다).
+- **한컴 편집기 PDF 를 오라클로 제공하실 때**: `pdf/{원본 stem}-{한컴버전}.pdf` 명명
+  (예: `pdf/issue1835_tac_stale_height-2022.pdf`), PR 본문에 생성 환경(한컴 버전)을
+  명시해주세요. 재현 fixture 는 가능하면 1~2페이지로 축소해 `samples/` 에 포함합니다.
 
 ## 브랜치 규칙
 
@@ -194,16 +327,31 @@ rhwp-studio/        ← 웹 에디터 (TypeScript + Vite)
 - `cargo clippy -- -D warnings` 경고 0건 (CI에서 강제)
 - `unwrap()` 최소화
 - 모든 문서는 한국어로 작성
+- **소스 포맷 분기**: HWP3/HWPX 등 원본 포맷에 따른 레이아웃 분기가 필요하면
+  boolean 전달이나 포맷 이름 비교 대신 `Document::layout_profile()` 질의를
+  사용합니다 (`mydocs/tech/parser_architecture.md` 의 "소스 출처와 레이아웃
+  호환 정책" 참조). 새 판별이 필요하면 profile 질의를 추가하는 방식으로
+  엽니다.
 
 ## 문서 작성 규칙
 
 rhwp는 코드뿐 아니라 **작업 과정의 기록**도 프로젝트의 일부입니다(Hyper-Waterfall 방법론). PR에 문서를 포함하시는 경우 아래 규칙을 지켜주세요.
 
+> **문서 거버넌스**: 절차의 권위는 canonical 문서에 단일 기록됩니다 — 진입점은
+> [`mydocs/README.md`](mydocs/README.md)(문서 지도·manifest)이고, 이 문서의 표는 요약입니다.
+> 충돌 시 canonical 문서가 우선합니다.
+>
+> **AI 도구를 쓰신다면**: 저장소 루트의 [`AGENTS.md`](AGENTS.md)가 에이전트 부트스트랩
+> 파일입니다 (CLAUDE.md는 이를 가리키는 부트로더). 에이전트가 AGENTS.md 의 로딩 순서를
+> 따르면 이 저장소의 절차와 검증 규칙을 그대로 파악합니다.
+
 ### 폴더 구조 (`mydocs/` 하위)
+
+> 폴더 역할의 canonical 은 [`docs_and_git_workflow.md`](mydocs/manual/codex/docs_and_git_workflow.md) 의 Folder Roles 입니다. 아래 표는 기여자 관점 요약입니다.
 
 | 폴더 | 용도 |
 |------|------|
-| `orders/` | 일일 작업지시 (`yyyymmdd.md`만 허용) |
+| `orders/` | 메인터너 전용 일일 운영 기록 (`yyyymmdd.md`만 허용, 외부 기여자 PR에서는 수정하지 않음) |
 | `plans/` | 수행 계획서, 구현 계획서 |
 | `working/` | 단계별 완료 보고서 (`_stage{N}.md`) |
 | `report/` | 최종 결과보고서 (`_report.md`) **— 최종 보고서는 반드시 여기** |
@@ -211,7 +359,30 @@ rhwp는 코드뿐 아니라 **작업 과정의 기록**도 프로젝트의 일�
 | `tech/` | 기술 조사·분석 (스펙 정오표, 라이브러리 발견 등) |
 | `manual/` | 사용자/개발자 매뉴얼 |
 | `troubleshootings/` | 트러블슈팅 (재발 방지용 해결 기록) |
-| `pr/` | **외부 기여자 PR 검토 기록** (메인테이너가 관리, 기여자는 작성 불필요) |
+| `pr/` | **PR 검토 기록** (메인테이너·collaborator가 관리, 외부 기여자는 작성 불필요) |
+
+### 문서 메타데이터 (front matter)
+
+`mydocs/manual/`, `mydocs/tech/`, `mydocs/troubleshootings/` 에 문서를 추가·수정할 때는
+**front matter 4필드가 필수**입니다:
+
+```markdown
+---
+kind: investigation        # canonical | guide | reference | investigation | decision | snapshot | memory
+status: active             # active | historical | superseded
+canonical: mydocs/manual/codex/docs_and_git_workflow.md   # 이 문서가 따르는 권위 문서 경로
+last_verified: 2026-07-17  # 역할·canonical 관계를 마지막으로 확인한 날짜
+---
+```
+
+로컬 검사 (CI 미실행 — 필요 시 실행):
+
+```bash
+python3 scripts/check_document_metadata.py   # front matter 4필드 검사
+python3 scripts/check_markdown_links.py      # 상대 링크 검사
+```
+
+`plans/`, `working/`, `report/`, `orders/` 의 타스크 문서에는 front matter가 필요 없습니다.
 
 ### 파일명 규칙
 
@@ -233,8 +404,13 @@ rhwp는 코드뿐 아니라 **작업 과정의 기록**도 프로젝트의 일�
 ### 기여자가 작성해야 하는 문서 범위
 
 기여자는 본인 작업 범위(내부 타스크 문서: `plans/`, `working/`, `report/`, `tech/`, `troubleshootings/` 등)만 작성합니다.
+`orders/`는 병합 뒤 상태를 기록하는 메인터너 전용 운영 문서이므로, 외부 기여자 PR에서 만들거나 갱신하지
+않습니다.
 
-**`pr/` 폴더는 메인테이너가 PR을 검토한 기록을 남기는 전용 공간**이므로, 기여자는 직접 작성할 필요가 없습니다. 메인테이너가 PR을 리뷰하면서 `pr_{번호}_review.md`, `pr_{번호}_report.md` 등을 자동으로 생성합니다. 이 파일들은 나중에 **PR 처리 이력으로 공개**되므로, 본인 PR이 어떻게 검토되었는지 추적 가능합니다.
+**`pr/` 폴더는 메인테이너와 collaborator가 PR을 검토한 기록을 남기는 전용 공간**이므로,
+외부 기여자는 직접 작성할 필요가 없습니다. PR 생성으로 번호가 확정된 뒤 메인테이너나 collaborator가
+`pr_{번호}_review.md`, `pr_{번호}_report.md` 등을 해당 PR branch의 후속 commit으로 생성합니다. 이 파일들은
+나중에 **PR 처리 이력으로 공개**되므로, 본인 PR이 어떻게 검토되었는지 추적 가능합니다.
 
 ### 이 규칙이 애매하다면
 
@@ -257,3 +433,39 @@ rhwp는 코드뿐 아니라 **작업 과정의 기록**도 프로젝트의 일�
 ## License
 
 이 프로젝트는 [MIT License](LICENSE)로 배포됩니다. 기여하신 코드도 동일한 라이선스가 적용됩니다.
+
+## LLM/에이전트 보조 기여
+
+이 저장소는 AI 에이전트가 1급 소비자이자 1급 기여자다. Claude Code·Copilot·
+Cursor·Codex·Gemini CLI·Windsurf·Cline 이 **자동으로 읽는 지침 파일**이 전부
+준비돼 있다 — 어떤 도구를 쓰든 같은 규약([AGENTS.md](AGENTS.md))에 도착한다.
+
+| 도구 | 자동 로딩 파일 |
+|---|---|
+| Claude Code | `CLAUDE.md` → `AGENTS.md` (+ `.claude/skills/` 자동 발견 — 기여 절차는 `rhwp-contributor`) |
+| Codex | `AGENTS.md` |
+| GitHub Copilot | `.github/copilot-instructions.md` |
+| Cursor | `.cursor/rules/rhwp.mdc` |
+| Gemini CLI | `GEMINI.md` |
+| Windsurf / Cline | `.windsurfrules` / `.clinerules` |
+| AGENTS.md 표준 진영 — Codex·OpenCode·Jules·Amp·Zed·Devin·Antigravity·Grok Build·Kimi CLI·Pi 등 | `AGENTS.md` (도구 공통 표준) |
+| 오케스트레이터(ADE) — Orca 등 워크트리 병렬 진영 | 자체 파일 없음 — 부리는 각 에이전트(Claude Code·Codex·OpenCode 등)의 파일이 그대로 적용 |
+| AWS Kiro (Amazon Q 후계) | `.kiro/steering/` |
+| Qwen Code | `QWEN.md` |
+| Aider 계열(컨벤션 파일) | `CONVENTIONS.md` |
+| Zed 계열(.rules) | `.rules` |
+| Goose | `.goosehints` |
+| Replit Agent | `replit.md` |
+| RooCode / Kilo Code | `.roo/rules/` / `.kilocode/rules/` |
+| JetBrains Junie | `.junie/guidelines.md` |
+| Trae / Amazon Q(일몰 예정·Kiro 승계) / Augment / Continue | `.trae/rules/` · `.amazonq/rules/` · `.augment/rules/` · `.continue/rules/` |
+| llms.txt 소비 도구 | `llms.txt` |
+
+**모델이 무엇이든 같은 길** — DeepSeek·GLM·Llama·Qwen·MiMo·MiniMax 등 어떤 모델(무료 모델 포함)을
+쓰든, 그 모델을 부리는 위 CLI/IDE 가 이 파일들을 자동으로 읽으므로 결국 같은 규약에 도착한다.
+저장소 파일을 읽지 않는 도구(영상·미디어 생성형 등)는 이 표의 범위 밖이다.
+
+에이전트 보조로 문서를 실제 편집·생성했다면 **작업 증빙**을 권장한다:
+`rhwp replay --plan-json <계획> --capsule work.capsule.json` 이 만든 캡슐(3해시
+영수증)이나 관련 `--json` 봉투 원문을 PR 에 붙이면, 리뷰어가 주장 대신
+재계산으로 검증할 수 있다. 상세는 AGENTS.md 의 "작업 증빙" 절.

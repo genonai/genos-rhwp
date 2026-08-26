@@ -34,8 +34,20 @@
   "optionsHoverPreview": {
     "message": "Show preview when hovering over HWP links"
   },
+  "optionsDisableExternalWebFonts": {
+    "message": "Do not use external web fonts"
+  },
+  "optionsDisableExternalWebFontsDesc": {
+    "message": "Recommended for intranet/offline environments. Some documents may show different fonts, line breaks, or page layout."
+  },
   "optionsSaved": {
     "message": "Saved"
+  },
+  "optionsSaveError": {
+    "message": "Could not save settings. Please try again."
+  },
+  "optionsLoadError": {
+    "message": "Could not load settings. Please reopen this page."
   },
   "optionsPrivacy": {
     "message": "Files are never sent to any server. All processing happens locally in your browser."
